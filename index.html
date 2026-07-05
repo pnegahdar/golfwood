@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MCG Tee-Time Pressure</title>
+    <style>
+      :root {
+        color: #17201b;
+        background: #f5f7f2;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      body {
+        margin: 0;
+        overflow-x: hidden;
+      }
+
+      .install-strip {
+        align-items: center;
+        background: #18221d;
+        color: #eef5ec;
+        display: flex;
+        gap: 14px;
+        justify-content: center;
+        min-height: 52px;
+        overflow-wrap: anywhere;
+        padding: 10px 16px;
+      }
+
+      .install-strip a {
+        background: #ffffff;
+        border-radius: 8px;
+        color: #17201b;
+        font-size: 13px;
+        font-weight: 800;
+        flex: 0 0 auto;
+        line-height: 1;
+        padding: 10px 12px;
+        text-decoration: none;
+      }
+
+      .install-strip span {
+        font-size: 13px;
+        line-height: 1.35;
+        max-width: 780px;
+        min-width: 0;
+      }
+
+      .install-version {
+        color: #cfe0d0;
+        font-weight: 800;
+      }
+
+      #mcg-preview-root {
+        min-height: calc(100vh - 72px);
+      }
+
+      @media (max-width: 720px) {
+        .install-strip {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        .install-strip span {
+          width: 100%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="install-strip">
+      <a id="bookmarklet-link" href="#">MCG pressure</a>
+      <span id="bookmarklet-help">Drag this tiny loader bookmarklet to bookmarks, then click it on the TenFore MCG page. Preview uses sample data.</span>
+    </div>
+    <div id="mcg-preview-root"></div>
+    <script src="./app.js"></script>
+    <script>
+      (function () {
+        var link = document.getElementById("bookmarklet-link");
+        var help = document.getElementById("bookmarklet-help");
+        var version = window.__MCG_TEE_PRESSURE_VERSION__;
+
+        function escapeHTML(value) {
+          return String(value == null ? "" : value).replace(/[&<>"']/g, function (char) {
+            return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char];
+          });
+        }
+
+        if (!version) {
+          link.removeAttribute("href");
+          help.textContent = "App version did not load. Refresh this page or restart the local static server.";
+          return;
+        }
+
+        var sourceUrl = new URL("./app.js", window.location.href);
+
+        var loader = [
+          "(function(){",
+          "var wanted=", JSON.stringify(version.id), ";",
+          "var srcBase=", JSON.stringify(sourceUrl.href), ";",
+          "var target='https://fox.tenfore.golf/mcggolf';",
+          "var current=(window.__MCG_TEE_PRESSURE_VERSION__&&window.__MCG_TEE_PRESSURE_VERSION__.id)||'';",
+          "if(document.getElementById('mcg-preview-root')){",
+          "alert(current===wanted?'MCG pressure bookmarklet is current: '+wanted:'Bookmarklet '+wanted+'; preview '+(current||'not loaded')+'. Drag the bookmarklet again from this page.');",
+          "return;",
+          "}",
+          "if(location.hostname!=='fox.tenfore.golf'){",
+          "window.open(target,'_blank','noopener');",
+          "alert('Opened TenFore. Browser security will not let this tab inject into the new tab; click this bookmarklet again after TenFore loads.');",
+          "return;",
+          "}",
+          "function load(){",
+          "var old=document.querySelector('script[data-mcg-pressure-loader]');",
+          "if(old)old.remove();",
+          "var s=document.createElement('script');",
+          "var src=srcBase+(srcBase.indexOf('?')===-1?'?':'&')+'cb='+Date.now();",
+          "s.src=src;",
+          "s.async=true;",
+          "s.dataset.mcgPressureLoader=wanted;",
+          "s.onerror=function(){alert('Could not load MCG pressure from '+srcBase);};",
+          "(document.head||document.documentElement).appendChild(s);",
+          "}",
+          "if(document.readyState==='loading')window.addEventListener('load',function(){setTimeout(load,500);},{once:true});else load();",
+          "})()"
+        ].join("");
+
+        link.href = "javascript:" + encodeURIComponent(loader);
+        help.innerHTML = 'Drag this tiny loader bookmarklet to bookmarks. Off TenFore it opens the MCG page; on TenFore it loads <span class="install-version">' +
+          escapeHTML(sourceUrl.href) + '</span> with a fresh cache-buster each click. Current build: <span class="install-version">' +
+          escapeHTML(version.id + ' · ' + version.changedAt + ' · ' + version.note) + '</span>';
+      })();
+
+      (function () {
+        var marker = "";
+
+        async function readMarker() {
+          var response = await fetch("./app.js", { method: "HEAD", cache: "no-store" });
+          if (!response.ok) return "";
+          return response.headers.get("last-modified") || response.headers.get("etag") || "";
+        }
+
+        async function checkForUpdate() {
+          try {
+            var next = await readMarker();
+            if (!next) return;
+            if (!marker) {
+              marker = next;
+            } else if (next !== marker) {
+              window.location.reload();
+            }
+          } catch (error) {
+            // The preview should keep working if the server is briefly unavailable.
+          }
+        }
+
+        checkForUpdate();
+        window.setInterval(checkForUpdate, 2000);
+      })();
+    </script>
+  </body>
+</html>
