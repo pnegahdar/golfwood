@@ -11,9 +11,9 @@
   };
 
   var VERSION = {
-    id: "v0.4.16",
-    changedAt: "2026-07-05 16:48 EDT",
-    note: "Root tee-time booking links"
+    id: "v0.4.17",
+    changedAt: "2026-07-08 12:38 EDT",
+    note: "Fullness score pills"
   };
 
   window.__MCG_TEE_PRESSURE_VERSION__ = VERSION;
@@ -426,7 +426,7 @@
       cursor: pointer;
       display: grid;
       gap: 10px;
-      grid-template-columns: 132px 64px 78px 1fr 24px;
+      grid-template-columns: minmax(132px, 1fr) auto minmax(78px, auto) 24px;
       min-height: 42px;
       padding: 7px 10px;
       text-align: left;
@@ -439,38 +439,63 @@
       white-space: nowrap;
     }
 
-    .mcg-bucket-meta {
-      align-items: center;
+    .mcg-temp {
       color: #3e4f46;
-      display: flex;
-      flex-wrap: wrap;
-      font-size: 13px;
-      font-weight: 850;
-      gap: 8px;
-      justify-content: flex-start;
-      white-space: nowrap;
-    }
-
-    .mcg-bucket-meta strong {
-      color: #17201b;
-      font-size: 16px;
-      font-weight: 950;
-    }
-
-    .mcg-score {
-      color: #214236;
       font-size: 14px;
       font-weight: 950;
       justify-self: end;
       white-space: nowrap;
     }
 
-    .mcg-temp {
-      color: #3e4f46;
-      font-size: 14px;
+    .mcg-fill {
+      align-items: center;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      display: inline-flex;
+      font-size: 13px;
       font-weight: 950;
-      justify-self: center;
+      gap: 6px;
+      justify-self: end;
+      min-width: 70px;
+      padding: 5px 8px;
       white-space: nowrap;
+    }
+
+    .mcg-fill-dot {
+      border-radius: 999px;
+      flex: 0 0 8px;
+      height: 8px;
+      width: 8px;
+    }
+
+    .mcg-fill.low {
+      background: #e8f5ee;
+      border-color: #b7d9c5;
+      color: #1f6d49;
+    }
+
+    .mcg-fill.low .mcg-fill-dot {
+      background: #27865b;
+    }
+
+    .mcg-fill.mid {
+      background: #fff4d6;
+      border-color: #e8cf85;
+      color: #7b510f;
+    }
+
+    .mcg-fill.mid .mcg-fill-dot {
+      background: #c27a16;
+    }
+
+    .mcg-fill.high {
+      background: #ffe8e3;
+      border-color: #efb4a8;
+      color: #8b3327;
+    }
+
+    .mcg-fill.high .mcg-fill-dot {
+      background: #c84b39;
     }
 
     .mcg-chevron {
@@ -509,7 +534,7 @@
       border-radius: 8px;
       display: grid;
       gap: 8px;
-      grid-template-columns: 86px 60px 68px 46px;
+      grid-template-columns: 86px 1fr minmax(70px, auto) 46px;
       min-height: 38px;
       padding: 6px 10px;
       align-items: center;
@@ -545,6 +570,8 @@
     .mcg-micro {
       color: #627168;
       font-size: 12px;
+      grid-column: 4;
+      justify-self: end;
       line-height: 1.35;
     }
 
@@ -583,39 +610,18 @@
       text-transform: uppercase;
     }
 
-    .mcg-adjacent {
-      color: #3e4f46;
-      display: grid;
-      font-size: 11px;
-      gap: 2px;
-      line-height: 1.15;
-    }
-
-    .mcg-bar {
-      background: #e8eee5;
-      border-radius: 999px;
-      height: 7px;
-      overflow: hidden;
-    }
-
-    .mcg-bar span {
-      background: #2d7b55;
-      display: block;
-      height: 100%;
-      width: 0%;
-    }
-
-    .mcg-bar.busy span {
-      background: #d08222;
-    }
-
     .mcg-link {
       color: #214236;
       font-size: 12px;
       font-weight: 900;
+      grid-column: 4;
       justify-self: end;
       text-decoration: none;
       white-space: nowrap;
+    }
+
+    .mcg-time-fill {
+      grid-column: 3;
     }
 
     .mcg-empty {
@@ -749,24 +755,12 @@
       }
 
       .mcg-bucket-head {
-        grid-template-columns: minmax(96px, 1fr) 44px 66px 50px 18px;
+        grid-template-columns: minmax(96px, 1fr) auto minmax(70px, auto) 18px;
         gap: 6px;
       }
 
-      .mcg-bucket-meta {
-        justify-content: flex-start;
-      }
-
       .mcg-time {
-        grid-template-columns: 74px 1fr 58px 58px;
-      }
-
-      .mcg-adjacent, .mcg-bar, .mcg-link {
-        grid-column: span 1;
-      }
-
-      .mcg-bar {
-        display: none;
+        grid-template-columns: 74px 1fr minmax(70px, auto) 46px;
       }
     }
   `;
@@ -1504,58 +1498,22 @@
   }
 
   function sortedTimes(times) {
-    var list = withNeighbors(times);
+    var list = times.slice();
     list.sort(compareSlots);
     return list;
   }
 
   function compareSlots(a, b) {
-    if (state.sort === "score") return bufferSort(b) - bufferSort(a) || a.booked - b.booked || compareSlotTimes(a, b);
-    if (state.sort === "least") return a.flowScore - b.flowScore || a.booked - b.booked || bufferSort(b) - bufferSort(a) || compareSlotTimes(a, b);
-    if (state.sort === "most-open") return b.available - a.available || a.booked - b.booked || compareSlotTimes(a, b);
+    if (state.sort === "score") return slotPressure(a) - slotPressure(b) || a.booked - b.booked || b.available - a.available || compareSlotTimes(a, b);
     return compareSlotTimes(a, b);
-  }
-
-  function bufferSort(slot) {
-    return slot.bufferMinutes == null ? 9999 : slot.bufferMinutes;
   }
 
   function compareSlotTimes(a, b) {
     return slotMinutes(a) - slotMinutes(b) || String(a.rawTime).localeCompare(String(b.rawTime));
   }
 
-  function withNeighbors(times) {
-    var chronological = times.slice().sort(function (a, b) {
-      return compareSlotTimes(a, b);
-    });
-    var bookedMinutes = chronological.filter(function (slot) { return slot.booked > 0; }).map(slotMinutes);
-
-    return chronological.map(function (slot, index) {
-      var before = chronological[index - 1] || null;
-      var after = chronological[index + 1] || null;
-      var beforeBooked = before ? before.booked : null;
-      var afterBooked = after ? after.booked : null;
-      var currentMinutes = slotMinutes(slot);
-      var bufferMinutes = null;
-
-      if (slot.booked > 0) {
-        bufferMinutes = 0;
-      } else {
-        bookedMinutes.forEach(function (minutes) {
-          var distance = Math.abs(minutes - currentMinutes);
-          bufferMinutes = bufferMinutes == null ? distance : Math.min(bufferMinutes, distance);
-        });
-      }
-
-      var flowScore = slot.booked + (beforeBooked == null ? 0 : beforeBooked * 0.55) + (afterBooked == null ? 0 : afterBooked * 0.75);
-
-      return Object.assign({}, slot, {
-        beforeBooked: beforeBooked,
-        afterBooked: afterBooked,
-        bufferMinutes: bufferMinutes,
-        flowScore: flowScore
-      });
-    });
+  function slotPressure(slot) {
+    return slot.maxPlayers ? slot.booked / slot.maxPlayers : 1;
   }
 
   function slotMinutes(slot) {
@@ -1585,12 +1543,6 @@
     return displayHours + ":" + String(mins).padStart(2, "0") + " " + suffix;
   }
 
-  function formatScore(minutes) {
-    if (minutes == null) return "clear";
-    if (minutes === 0) return "0m";
-    return "+" + minutes + "m";
-  }
-
   function bucketTimes(times) {
     var buckets = new Map();
 
@@ -1617,7 +1569,6 @@
       bucket.open += slot.available;
       bucket.capacity += slot.maxPlayers;
       bucket.assumed = bucket.assumed && slot.assumedAvailability;
-      bucket.bufferMinutes = bucket.bufferMinutes == null ? slot.bufferMinutes : slot.bufferMinutes == null ? bucket.bufferMinutes : Math.min(bucket.bufferMinutes, slot.bufferMinutes);
     });
 
     var groups = Array.from(buckets.values());
@@ -1627,17 +1578,11 @@
     });
 
     groups.sort(function (a, b) {
-      if (state.sort === "score") return bucketBufferSort(b) - bucketBufferSort(a) || a.pressure - b.pressure || a.start - b.start;
-      if (state.sort === "least") return a.pressure - b.pressure || a.booked - b.booked || bucketBufferSort(b) - bucketBufferSort(a) || a.start - b.start;
-      if (state.sort === "most-open") return b.open - a.open || a.pressure - b.pressure || a.start - b.start;
+      if (state.sort === "score") return a.pressure - b.pressure || a.booked - b.booked || b.open - a.open || a.start - b.start;
       return a.start - b.start;
     });
 
     return groups;
-  }
-
-  function bucketBufferSort(bucket) {
-    return bucket.bufferMinutes == null ? 9999 : bucket.bufferMinutes;
   }
 
   function selectedCourse() {
@@ -1800,11 +1745,8 @@
       '<section class="mcg-bucket', best ? " best" : "", expanded ? " expanded" : "", '">',
       '<button type="button" class="mcg-bucket-head" data-bucket="', escapeHTML(key), '" aria-expanded="', expanded ? "true" : "false", '">',
       '<div class="mcg-bucket-title">', escapeHTML(bucket.label), "</div>",
-      '<div class="mcg-bucket-meta">',
-      '<strong title="booked / capacity">', escapeHTML(bucket.booked), "/", escapeHTML(bucket.capacity), escapeHTML(assumed), "</strong>",
-      "</div>",
       '<div class="mcg-temp" title="', escapeHTML(weather.title || "hourly weather"), '">', escapeHTML(weather.label), "</div>",
-      '<div class="mcg-score" title="nearest booked slot">', escapeHTML(formatScore(bucket.bufferMinutes)), "</div>",
+      renderFill(bucket.booked, bucket.capacity, bucket.pressure, assumed, ""),
       '<div class="mcg-chevron">›</div>',
       "</button>",
       expanded ? [
@@ -1842,18 +1784,32 @@
   }
 
   function renderTimeCard(slot) {
-    var busy = slot.flowScore >= Math.max(3, slot.maxPlayers);
     var bookUrl = bookingUrl(slot);
     var source = slot.assumedAvailability ? "*" : "";
 
     return [
       '<article class="mcg-time">',
       '<div class="mcg-time-clock">', escapeHTML(slot.timeText), '</div>',
-      '<div class="mcg-bucket-meta"><strong title="booked / capacity">', escapeHTML(slot.booked), "/", escapeHTML(slot.maxPlayers), escapeHTML(source), "</strong></div>",
-      '<div class="mcg-score', busy ? " busy" : "", '" title="nearest booked slot">', escapeHTML(formatScore(slot.bufferMinutes)), "</div>",
+      renderFill(slot.booked, slot.maxPlayers, slotPressure(slot), source, " mcg-time-fill"),
       bookUrl ? '<a class="mcg-link" href="' + escapeHTML(bookUrl) + '" target="_blank" rel="noopener">Book</a>' : '<span class="mcg-micro">No booking link</span>',
       "</article>"
     ].join("");
+  }
+
+  function renderFill(booked, capacity, pressure, suffix, extraClass) {
+    var label = booked + "/" + capacity + (suffix || "");
+    return [
+      '<div class="mcg-fill ', escapeHTML(fillClass(pressure)), escapeHTML(extraClass || ""), '" title="', escapeHTML(label), ' booked">',
+      '<span class="mcg-fill-dot"></span>',
+      '<strong>', escapeHTML(label), "</strong>",
+      "</div>"
+    ].join("");
+  }
+
+  function fillClass(pressure) {
+    if (pressure >= 0.7) return "high";
+    if (pressure >= 0.35) return "mid";
+    return "low";
   }
 
   function bookingUrl(slot) {
