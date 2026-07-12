@@ -11,9 +11,9 @@
   };
 
   var VERSION = {
-    id: "v0.4.17",
-    changedAt: "2026-07-08 12:38 EDT",
-    note: "Fullness score pills"
+    id: "v0.4.18",
+    changedAt: "2026-07-11 20:25 EDT",
+    note: "Player count control"
   };
 
   window.__MCG_TEE_PRESSURE_VERSION__ = VERSION;
@@ -198,6 +198,34 @@
     .mcg-toggle.active {
       background: #214236;
       color: #ffffff;
+    }
+
+    .mcg-player-control {
+      align-items: center;
+      background: #f8faf6;
+      border: 1px solid #cfd9cd;
+      border-radius: 8px;
+      color: #17201b;
+      display: inline-flex;
+      font-size: 12px;
+      font-weight: 900;
+      gap: 7px;
+      height: 38px;
+      padding: 0 8px;
+      white-space: nowrap;
+    }
+
+    .mcg-player-input {
+      background: #ffffff;
+      border: 1px solid #dfe6dc;
+      border-radius: 6px;
+      color: #17201b;
+      font-size: 14px;
+      font-weight: 950;
+      height: 28px;
+      padding: 0 4px;
+      text-align: center;
+      width: 42px;
     }
 
     .mcg-custom-date {
@@ -746,6 +774,11 @@
         flex: 1;
       }
 
+      .mcg-player-control {
+        justify-content: center;
+        width: 100%;
+      }
+
       .mcg-summary {
         grid-template-columns: 1fr;
       }
@@ -829,6 +862,7 @@
     courses: [],
     selectedKey: "",
     date: todayISO(),
+    players: initialPlayers(),
     sort: initialSort(),
     showCustomDate: false,
     timesByCourse: new Map(),
@@ -869,6 +903,29 @@
       return value === "score" || value === "time" ? value : "time";
     } catch (error) {
       return "time";
+    }
+  }
+
+  function clampPlayers(value) {
+    var players = parseInt(value, 10);
+    if (!Number.isFinite(players)) return 1;
+    return Math.max(1, Math.min(4, players));
+  }
+
+  function initialPlayers() {
+    try {
+      return clampPlayers(localStorage.getItem("mcg-pressure-players"));
+    } catch (error) {
+      return 1;
+    }
+  }
+
+  function persistPlayers(value) {
+    state.players = clampPlayers(value);
+    try {
+      localStorage.setItem("mcg-pressure-players", String(state.players));
+    } catch (error) {
+      // Storage can be unavailable in private modes; player count should still work.
     }
   }
 
@@ -923,6 +980,10 @@
 
   function courseKey(course) {
     return course.id + ":" + (course.subCourseId || 0);
+  }
+
+  function requestKey(course) {
+    return [courseKey(course), state.date, "p" + state.players].join(":");
   }
 
   function withCourseCoords(course) {
@@ -1360,15 +1421,17 @@
         customers: Array.from({ length: row[1] }),
         price: row[1] === 0 ? 47 : 52
       }, course);
+    }).filter(function (slot) {
+      return slot.available >= state.players;
     });
-    state.debugByCourse.set(courseKey(course), makeDebug(course, "preview"));
-    state.debugByCourse.get(courseKey(course)).search.available = times.length;
+    state.debugByCourse.set(requestKey(course), makeDebug(course, "preview"));
+    state.debugByCourse.get(requestKey(course)).search.available = times.length;
     return times;
   }
 
   async function loadTimes(course) {
     var debug = makeDebug(course, state.live ? "live" : "preview");
-    state.debugByCourse.set(courseKey(course), debug);
+    state.debugByCourse.set(requestKey(course), debug);
 
     if (!state.live) {
       await new Promise(function (resolve) { setTimeout(resolve, 120); });
@@ -1412,6 +1475,7 @@
       courseId: course.id,
       subCourseId: course.subCourseId || "",
       holes: course.defaultHoles || 18,
+      players: state.players,
       search: { raw: null, matched: null, available: null, error: "" },
       v4: { raw: null, matched: null, available: null, error: "" },
       sample: ""
@@ -1426,14 +1490,14 @@
         golfCourseIds: course.id,
         dateFrom: state.date,
         dateTo: state.date + "T23:59:59",
-        players: 1,
+        players: state.players,
         holes: course.defaultHoles || 18
       }
     });
 
     var data = Array.isArray(payload && payload.data) ? payload.data : Array.isArray(payload) ? payload : [];
     var matched = data.filter(function (raw) { return matchesCourseVariant(raw, course); });
-    var available = matched.map(function (raw) { return normalizeTime(raw, course); }).filter(function (slot) { return slot.available > 0; });
+    var available = matched.map(function (raw) { return normalizeTime(raw, course); }).filter(function (slot) { return slot.available >= state.players; });
 
     if (debug) {
       debug.search.raw = data.length;
@@ -1486,7 +1550,7 @@
 
     var data = Array.isArray(payload.data) ? payload.data : Array.isArray(payload) ? payload : [];
     var matched = data.filter(function (raw) { return matchesCourseVariant(raw, course); });
-    var available = matched.map(function (raw) { return normalizeTime(raw, course); }).filter(function (slot) { return slot.available > 0; });
+    var available = matched.map(function (raw) { return normalizeTime(raw, course); }).filter(function (slot) { return slot.available >= state.players; });
 
     if (debug) {
       debug.v4.raw = data.length;
@@ -1591,7 +1655,7 @@
 
   function selectedTimes() {
     var course = selectedCourse();
-    return course ? state.timesByCourse.get(courseKey(course)) || [] : [];
+    return course ? state.timesByCourse.get(requestKey(course)) || [] : [];
   }
 
   function summary(times) {
@@ -1631,6 +1695,7 @@
       "</div>",
       '<div class="mcg-controls">',
       renderWeekdayButtons(),
+      renderPlayerControl(),
       renderSortButtons(),
       '<button class="mcg-button" data-action="refresh"', state.loading ? " disabled" : "", ">", state.loading ? "Loading" : "Refresh", "</button>",
       state.live ? '<button class="mcg-button secondary" data-action="close">Exit</button>' : "",
@@ -1669,6 +1734,15 @@
     ].join("");
   }
 
+  function renderPlayerControl() {
+    return [
+      '<label class="mcg-player-control" title="Players">',
+      '<span>Players</span>',
+      '<input class="mcg-player-input" data-action="players" type="number" inputmode="numeric" min="1" max="4" step="1" value="', escapeHTML(state.players), '" aria-label="Players">',
+      "</label>"
+    ].join("");
+  }
+
   function renderSidebar() {
     return [
       '<aside class="mcg-sidebar">',
@@ -1681,7 +1755,8 @@
 
   function renderCourseButton(course) {
     var key = courseKey(course);
-    var count = state.timesByCourse.has(key) ? state.timesByCourse.get(key).length : "";
+    var loadedKey = requestKey(course);
+    var count = state.timesByCourse.has(loadedKey) ? state.timesByCourse.get(loadedKey).length : "";
     var img = course.imageUrl ? '<img src="' + escapeHTML(course.imageUrl) + '" alt="">' : '<div class="mcg-course-fallback">' + escapeHTML(course.label.slice(0, 2).toUpperCase()) + "</div>";
     return [
       '<button class="mcg-course', key === state.selectedKey ? " active" : "", '" data-course="', escapeHTML(key), '">',
@@ -1758,7 +1833,7 @@
   }
 
   function renderEmpty(course) {
-    var debug = course ? state.debugByCourse.get(courseKey(course)) : null;
+    var debug = course ? state.debugByCourse.get(requestKey(course)) : null;
     var details = "";
 
     if (debug) {
@@ -1769,7 +1844,7 @@
         debug.search.error ? "<br>Search error: " + escapeHTML(debug.search.error) : "",
         "<br>V4 raw ", escapeHTML(debugText(debug.v4.raw)), " / matched ", escapeHTML(debugText(debug.v4.matched)), " / available ", escapeHTML(debugText(debug.v4.available)),
         debug.v4.error ? "<br>V4 error: " + escapeHTML(debug.v4.error) : "",
-        "<br>Course ", escapeHTML(debug.courseId), debug.subCourseId ? " / subcourse " + escapeHTML(debug.subCourseId) : "", " / ", escapeHTML(debug.holes), " holes",
+        "<br>Course ", escapeHTML(debug.courseId), debug.subCourseId ? " / subcourse " + escapeHTML(debug.subCourseId) : "", " / ", escapeHTML(debug.holes), " holes / ", escapeHTML(debug.players), " players",
         debug.sample ? "<br>Sample " + escapeHTML(debug.sample) : "",
         "</div>"
       ].join("");
@@ -1816,7 +1891,7 @@
     if (!slot.teeTimeId) return "";
 
     var url = new URL("/tee-time/" + encodeURIComponent(slot.teeTimeId), "https://" + CONFIG.host);
-    url.searchParams.set("players", "1");
+    url.searchParams.set("players", String(state.players));
     if (slot.holes) url.searchParams.set("holes", String(slot.holes));
     url.searchParams.set("backToSearch", "true");
     if (slot.back9) url.searchParams.set("back9", "true");
@@ -1829,6 +1904,20 @@
     state.timesByCourse.clear();
     state.debugByCourse.clear();
     state.weatherByCourseDate.clear();
+    state.expandedBuckets.clear();
+    await ensureSelectedTimes();
+  }
+
+  async function setPlayers(value) {
+    var next = clampPlayers(value);
+    if (state.players === next) {
+      render();
+      return;
+    }
+
+    persistPlayers(next);
+    state.timesByCourse.clear();
+    state.debugByCourse.clear();
     state.expandedBuckets.clear();
     await ensureSelectedTimes();
   }
@@ -1852,6 +1941,16 @@
       customDate.addEventListener("click", function () {
         state.showCustomDate = !state.showCustomDate;
         render();
+      });
+    }
+
+    var players = state.shadow.querySelector('[data-action="players"]');
+    if (players) {
+      players.addEventListener("change", async function () {
+        await setPlayers(players.value);
+      });
+      players.addEventListener("keydown", function (event) {
+        if (event.key === "Enter") players.blur();
       });
     }
 
@@ -1893,8 +1992,8 @@
     if (refresh) {
       refresh.addEventListener("click", async function () {
         var course = selectedCourse();
-        if (course) state.timesByCourse.delete(courseKey(course));
-        if (course) state.debugByCourse.delete(courseKey(course));
+        if (course) state.timesByCourse.delete(requestKey(course));
+        if (course) state.debugByCourse.delete(requestKey(course));
         if (course) state.weatherByCourseDate.delete(weatherKey(course));
         await ensureSelectedTimes();
       });
@@ -1907,7 +2006,7 @@
   async function ensureSelectedTimes() {
     var course = selectedCourse();
     if (!course) return render();
-    var key = courseKey(course);
+    var key = requestKey(course);
     if (state.timesByCourse.has(key)) {
       if (!state.weatherByCourseDate.has(weatherKey(course))) await ensureWeather(course);
       return render();
