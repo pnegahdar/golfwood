@@ -11,9 +11,9 @@
   };
 
   var VERSION = {
-    id: "v0.4.18",
-    changedAt: "2026-07-11 20:25 EDT",
-    note: "Player count control"
+    id: "v0.4.19",
+    changedAt: "2026-08-28 15:38 EDT",
+    note: "All expanded slots and TenFore booking handoff"
   };
 
   window.__MCG_TEE_PRESSURE_VERSION__ = VERSION;
@@ -568,6 +568,10 @@
       align-items: center;
     }
 
+    .mcg-time.unbookable {
+      background: #fbfcfa;
+    }
+
     .mcg-time.best {
       border-color: #6f9c82;
       box-shadow: inset 3px 0 0 #2d7b55;
@@ -868,6 +872,7 @@
     timesByCourse: new Map(),
     debugByCourse: new Map(),
     weatherByCourseDate: new Map(),
+    bookingCourseByVanity: new Map(),
     expandedBuckets: new Set(),
     error: "",
     root: null,
@@ -983,7 +988,7 @@
   }
 
   function requestKey(course) {
-    return [courseKey(course), state.date, "p" + state.players].join(":");
+    return [courseKey(course), state.date].join(":");
   }
 
   function withCourseCoords(course) {
@@ -1164,7 +1169,7 @@
     var holes = Number(raw.numberOfHoles || raw.holes || raw.holeCount || course.defaultHoles || 18);
     var price = holes === 9 ? raw.priceBeforeTax9 ?? raw.priceBeforeTax : raw.priceBeforeTax18 ?? raw.priceBeforeTax;
     price = price ?? raw.price ?? raw.greenFee ?? raw.fee;
-    var rawSubCourseId = raw.subCourseId ?? raw.subCourseID ?? raw.teeTimeSubCourseId ?? raw.teeTimeSubCourseID ?? null;
+    var rawSubCourseId = raw.subCourseId ?? raw.subCourseID ?? raw.teeTimeSubCourseId ?? raw.teeTimeSubCourseID ?? course.subCourseId ?? null;
 
     return {
       id: teeTimeId || [courseKey(course), dateScheduled, raw.teeSheetTimeID || ""].join("-"),
@@ -1422,7 +1427,7 @@
         price: row[1] === 0 ? 47 : 52
       }, course);
     }).filter(function (slot) {
-      return slot.available >= state.players;
+      return slot.timeText;
     });
     state.debugByCourse.set(requestKey(course), makeDebug(course, "preview"));
     state.debugByCourse.get(requestKey(course)).search.available = times.length;
@@ -1490,14 +1495,14 @@
         golfCourseIds: course.id,
         dateFrom: state.date,
         dateTo: state.date + "T23:59:59",
-        players: state.players,
+        players: 1,
         holes: course.defaultHoles || 18
       }
     });
 
     var data = Array.isArray(payload && payload.data) ? payload.data : Array.isArray(payload) ? payload : [];
     var matched = data.filter(function (raw) { return matchesCourseVariant(raw, course); });
-    var available = matched.map(function (raw) { return normalizeTime(raw, course); }).filter(function (slot) { return slot.available >= state.players; });
+    var available = matched.map(function (raw) { return normalizeTime(raw, course); }).filter(function (slot) { return slot.timeText; });
 
     if (debug) {
       debug.search.raw = data.length;
@@ -1550,7 +1555,7 @@
 
     var data = Array.isArray(payload.data) ? payload.data : Array.isArray(payload) ? payload : [];
     var matched = data.filter(function (raw) { return matchesCourseVariant(raw, course); });
-    var available = matched.map(function (raw) { return normalizeTime(raw, course); }).filter(function (slot) { return slot.available >= state.players; });
+    var available = matched.map(function (raw) { return normalizeTime(raw, course); }).filter(function (slot) { return slot.timeText; });
 
     if (debug) {
       debug.v4.raw = data.length;
@@ -1859,14 +1864,15 @@
   }
 
   function renderTimeCard(slot) {
-    var bookUrl = bookingUrl(slot);
+    var canBook = slot.available >= state.players;
+    var bookUrl = canBook ? bookingUrl(slot) : "";
     var source = slot.assumedAvailability ? "*" : "";
 
     return [
-      '<article class="mcg-time">',
+      '<article class="mcg-time', canBook ? "" : " unbookable", '">',
       '<div class="mcg-time-clock">', escapeHTML(slot.timeText), '</div>',
       renderFill(slot.booked, slot.maxPlayers, slotPressure(slot), source, " mcg-time-fill"),
-      bookUrl ? '<a class="mcg-link" href="' + escapeHTML(bookUrl) + '" target="_blank" rel="noopener">Book</a>' : '<span class="mcg-micro">No booking link</span>',
+      bookUrl ? '<a class="mcg-link" href="' + escapeHTML(bookUrl) + '" data-book-slot="' + escapeHTML(slot.id) + '">Book</a>' : '<span class="mcg-micro" title="' + escapeHTML("Only " + slot.available + " open") + '">-</span>',
       "</article>"
     ].join("");
   }
@@ -1892,10 +1898,111 @@
 
     var url = new URL("/tee-time/" + encodeURIComponent(slot.teeTimeId), "https://" + CONFIG.host);
     url.searchParams.set("players", String(state.players));
-    if (slot.holes) url.searchParams.set("holes", String(slot.holes));
     url.searchParams.set("backToSearch", "true");
-    if (slot.back9) url.searchParams.set("back9", "true");
     return url.toString();
+  }
+
+  function bookingPath(slot) {
+    var url = new URL(bookingUrl(slot));
+    return url.pathname + url.search;
+  }
+
+  function selectedSlot(slotId) {
+    return selectedTimes().find(function (slot) { return String(slot.id) === String(slotId); }) || null;
+  }
+
+  async function loadBookingCourse(slot) {
+    var vanity = slot.vanityName || CONFIG.vanityName;
+    if (state.bookingCourseByVanity.has(vanity)) return state.bookingCourseByVanity.get(vanity);
+
+    var payload = await api("GolfCourse/GetGolfCourseByVanity", { params: { vanityName: vanity } });
+    var course = payload && payload.data && (payload.data.golfCourseID || payload.data.id) ? payload.data : payload;
+    if (!course || !(course.golfCourseID || course.id)) throw new Error("Could not load booking course.");
+
+    state.bookingCourseByVanity.set(vanity, course);
+    return course;
+  }
+
+  function tenForeApp() {
+    var root = document.getElementById("__nuxt");
+    if (root && root.__vue_app__) return root.__vue_app__;
+
+    var nodes = document.querySelectorAll("*");
+    for (var index = 0; index < nodes.length; index += 1) {
+      if (nodes[index].__vue_app__) return nodes[index].__vue_app__;
+    }
+
+    return null;
+  }
+
+  function tenForePinia(app) {
+    var provides = app && app._context && app._context.provides;
+    if (!provides) return null;
+
+    var keys = Reflect.ownKeys(provides);
+    for (var index = 0; index < keys.length; index += 1) {
+      var value = provides[keys[index]];
+      if (value && value._s && value.state) return value;
+    }
+
+    return null;
+  }
+
+  function tenForeRouter(app) {
+    var globalProperties = app && app._context && app._context.config && app._context.config.globalProperties;
+    if (globalProperties && globalProperties.$router && typeof globalProperties.$router.push === "function") return globalProperties.$router;
+
+    var provides = app && app._context && app._context.provides;
+    if (!provides) return null;
+
+    var keys = Reflect.ownKeys(provides);
+    for (var index = 0; index < keys.length; index += 1) {
+      var value = provides[keys[index]];
+      if (value && typeof value.push === "function" && value.currentRoute) return value;
+    }
+
+    return null;
+  }
+
+  async function primeTenForeCourse(slot) {
+    var app = tenForeApp();
+    var pinia = tenForePinia(app);
+    var store = pinia && pinia._s && pinia._s.get ? pinia._s.get("mainStore") : null;
+    if (!store || typeof store.setGolfCourse !== "function") return { app: app, primed: false };
+
+    var course = await loadBookingCourse(slot);
+    store.setGolfCourse(course);
+
+    if (slot.subCourseId && typeof store.setSubCourseId === "function") {
+      store.setSubCourseId(slot.subCourseId);
+    }
+
+    return { app: app, primed: true };
+  }
+
+  async function bookSlot(slotId) {
+    var slot = selectedSlot(slotId);
+    if (!slot || slot.available < state.players) return;
+
+    var url = bookingUrl(slot);
+    var path = bookingPath(slot);
+
+    if (state.live) {
+      try {
+        var context = await primeTenForeCourse(slot);
+        var router = tenForeRouter(context.app || tenForeApp());
+        if (router) {
+          window.__mcgTeePressureCleanup();
+          await router.push(path);
+          return;
+        }
+      } catch (error) {
+        console.warn("MCG pressure booking handoff failed; using direct URL.", error);
+      }
+    }
+
+    window.__mcgTeePressureCleanup();
+    window.location.assign(url);
   }
 
   async function setSelectedDate(value) {
@@ -1916,10 +2023,7 @@
     }
 
     persistPlayers(next);
-    state.timesByCourse.clear();
-    state.debugByCourse.clear();
-    state.expandedBuckets.clear();
-    await ensureSelectedTimes();
+    render();
   }
 
   function bindEvents() {
@@ -1963,6 +2067,13 @@
           state.expandedBuckets.add(key);
         }
         render();
+      });
+    });
+
+    state.shadow.querySelectorAll("[data-book-slot]").forEach(function (link) {
+      link.addEventListener("click", async function (event) {
+        event.preventDefault();
+        await bookSlot(link.dataset.bookSlot);
       });
     });
 
