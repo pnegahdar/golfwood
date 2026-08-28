@@ -11,9 +11,9 @@
   };
 
   var VERSION = {
-    id: "v0.4.19",
-    changedAt: "2026-08-28 15:38 EDT",
-    note: "All expanded slots and TenFore booking handoff"
+    id: "v0.4.20",
+    changedAt: "2026-08-28 15:57 EDT",
+    note: "Show tee-time prices"
   };
 
   window.__MCG_TEE_PRESSURE_VERSION__ = VERSION;
@@ -462,9 +462,19 @@
     }
 
     .mcg-bucket-title {
+      align-items: baseline;
+      display: flex;
       font-size: 15px;
       font-weight: 950;
+      gap: 8px;
+      min-width: 0;
       white-space: nowrap;
+    }
+
+    .mcg-bucket-price {
+      color: #627168;
+      font-size: 12px;
+      font-weight: 900;
     }
 
     .mcg-temp {
@@ -581,6 +591,14 @@
       font-size: 15px;
       font-weight: 950;
       line-height: 1;
+      white-space: nowrap;
+    }
+
+    .mcg-price {
+      color: #3e4f46;
+      font-size: 13px;
+      font-weight: 900;
+      min-width: 0;
       white-space: nowrap;
     }
 
@@ -1612,6 +1630,32 @@
     return displayHours + ":" + String(mins).padStart(2, "0") + " " + suffix;
   }
 
+  function priceNumber(value) {
+    if (value === null || value === undefined || value === "") return null;
+    if (typeof value === "number") return Number.isFinite(value) ? value : null;
+
+    var parsed = Number(String(value).replace(/[^0-9.-]/g, ""));
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function formatPrice(value) {
+    var price = priceNumber(value);
+    if (price === null) return "";
+
+    var rounded = Math.round(price * 100) / 100;
+    return "$" + (Math.abs(rounded % 1) < 0.005 ? String(Math.round(rounded)) : rounded.toFixed(2));
+  }
+
+  function bucketPrice(bucket) {
+    var prices = bucket.times.map(function (slot) { return priceNumber(slot.price); }).filter(function (price) { return price !== null; });
+    if (!prices.length) return "";
+
+    var min = Math.min.apply(Math, prices);
+    var max = Math.max.apply(Math, prices);
+    if (Math.abs(max - min) < 0.005) return formatPrice(min);
+    return formatPrice(min) + "-" + formatPrice(max);
+  }
+
   function bucketTimes(times) {
     var buckets = new Map();
 
@@ -1644,6 +1688,7 @@
     groups.forEach(function (bucket) {
       bucket.times.sort(compareSlotTimes);
       bucket.pressure = bucket.capacity ? bucket.booked / bucket.capacity : 1;
+      bucket.price = bucketPrice(bucket);
     });
 
     groups.sort(function (a, b) {
@@ -1824,7 +1869,7 @@
     return [
       '<section class="mcg-bucket', best ? " best" : "", expanded ? " expanded" : "", '">',
       '<button type="button" class="mcg-bucket-head" data-bucket="', escapeHTML(key), '" aria-expanded="', expanded ? "true" : "false", '">',
-      '<div class="mcg-bucket-title">', escapeHTML(bucket.label), "</div>",
+      '<div class="mcg-bucket-title"><span>', escapeHTML(bucket.label), "</span>", bucket.price ? '<span class="mcg-bucket-price">' + escapeHTML(bucket.price) + "</span>" : "", "</div>",
       '<div class="mcg-temp" title="', escapeHTML(weather.title || "hourly weather"), '">', escapeHTML(weather.label), "</div>",
       renderFill(bucket.booked, bucket.capacity, bucket.pressure, assumed, ""),
       '<div class="mcg-chevron">›</div>',
@@ -1871,6 +1916,7 @@
     return [
       '<article class="mcg-time', canBook ? "" : " unbookable", '">',
       '<div class="mcg-time-clock">', escapeHTML(slot.timeText), '</div>',
+      '<div class="mcg-price">', escapeHTML(formatPrice(slot.price)), "</div>",
       renderFill(slot.booked, slot.maxPlayers, slotPressure(slot), source, " mcg-time-fill"),
       bookUrl ? '<a class="mcg-link" href="' + escapeHTML(bookUrl) + '" data-book-slot="' + escapeHTML(slot.id) + '">Book</a>' : '<span class="mcg-micro" title="' + escapeHTML("Only " + slot.available + " open") + '">-</span>',
       "</article>"
