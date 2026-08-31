@@ -11,9 +11,9 @@
   };
 
   var VERSION = {
-    id: "v0.4.22",
-    changedAt: "2026-08-31 12:37 EDT",
-    note: "Merge V4 full-slot data and clarify unbookable rows"
+    id: "v0.4.23",
+    changedAt: "2026-08-31 12:43 EDT",
+    note: "Infer Search availability with 1-4 player probes"
   };
 
   window.__MCG_TEE_PRESSURE_VERSION__ = VERSION;
@@ -1595,6 +1595,25 @@
   }
 
   async function loadSearchTimes(course, debug) {
+    var data = await loadSearchRows(course, 1);
+    var available = normalizeSearchRows(data, course);
+
+    if (debug) {
+      debug.search.raw = data.length;
+      debug.search.matched = available.length;
+      debug.search.available = available.length;
+      debug.search.thresholds = "1:" + available.length;
+      debug.sample = summarizeRaw(data.find(function (raw) { return matchesCourseVariant(raw, course); }) || data[0]);
+    }
+
+    if (available.some(function (slot) { return slot.assumedAvailability; })) {
+      available = await inferSearchAvailability(course, available, debug);
+    }
+
+    return available;
+  }
+
+  async function loadSearchRows(course, players) {
     var payload = await api("TeeTimes/Search", {
       recaptcha: true,
       action: "teetimes_search",
@@ -1602,23 +1621,56 @@
         golfCourseIds: course.id,
         dateFrom: state.date,
         dateTo: state.date + "T23:59:59",
-        players: 1,
+        players: players,
         holes: course.defaultHoles || 18
       }
     });
 
-    var data = Array.isArray(payload && payload.data) ? payload.data : Array.isArray(payload) ? payload : [];
-    var matched = data.filter(function (raw) { return matchesCourseVariant(raw, course); });
-    var available = matched.map(function (raw) { return normalizeTime(raw, course); }).filter(function (slot) { return slot.timeText; });
+    return Array.isArray(payload && payload.data) ? payload.data : Array.isArray(payload) ? payload : [];
+  }
 
-    if (debug) {
-      debug.search.raw = data.length;
-      debug.search.matched = matched.length;
-      debug.search.available = available.length;
-      debug.sample = summarizeRaw(matched[0] || data[0]);
+  function normalizeSearchRows(data, course) {
+    return data.filter(function (raw) { return matchesCourseVariant(raw, course); }).map(function (raw) {
+      return normalizeTime(raw, course);
+    }).filter(function (slot) { return slot.timeText; });
+  }
+
+  async function inferSearchAvailability(course, slots, debug) {
+    var presence = new Map();
+    slots.forEach(function (slot) {
+      presence.set(timeMergeKey(slot), 1);
+    });
+
+    for (var players = 2; players <= Math.min(4, course.maxPlayers || 4); players += 1) {
+      try {
+        var rows = await loadSearchRows(course, players);
+        var matched = normalizeSearchRows(rows, course);
+        if (debug) debug.search.thresholds += " / " + players + ":" + matched.length;
+
+        matched.forEach(function (slot) {
+          presence.set(timeMergeKey(slot), players);
+        });
+      } catch (error) {
+        if (debug) debug.search.thresholds += " / " + players + ":err";
+        break;
+      }
     }
 
-    return available;
+    return slots.map(function (slot) {
+      if (!slot.assumedAvailability) return slot;
+
+      var available = presence.get(timeMergeKey(slot)) || 1;
+      var maxPlayers = slot.maxPlayers || course.maxPlayers || 4;
+      var booked = Math.max(0, maxPlayers - available);
+
+      return Object.assign({}, slot, {
+        available: available,
+        booked: booked,
+        availabilitySource: "search-player-thresholds",
+        assumedAvailability: false,
+        pressure: maxPlayers ? booked / maxPlayers : 0
+      });
+    });
   }
 
   function matchesCourseVariant(raw, course) {
@@ -2119,6 +2171,7 @@
         '<div class="mcg-debug">',
         escapeHTML(debug.version), " · ", escapeHTML(debug.changedAt), "<br>",
         "Search raw ", escapeHTML(debugText(debug.search.raw)), " / matched ", escapeHTML(debugText(debug.search.matched)), " / available ", escapeHTML(debugText(debug.search.available)),
+        debug.search.thresholds ? "<br>Search thresholds " + escapeHTML(debug.search.thresholds) : "",
         debug.search.error ? "<br>Search error: " + escapeHTML(debug.search.error) : "",
         "<br>V4 raw ", escapeHTML(debugText(debug.v4.raw)), " / matched ", escapeHTML(debugText(debug.v4.matched)), " / available ", escapeHTML(debugText(debug.v4.available)),
         debug.v4.error ? "<br>V4 error: " + escapeHTML(debug.v4.error) : "",
