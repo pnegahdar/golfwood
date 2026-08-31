@@ -11,9 +11,9 @@
   };
 
   var VERSION = {
-    id: "v0.4.23",
-    changedAt: "2026-08-31 12:43 EDT",
-    note: "Infer Search availability with 1-4 player probes"
+    id: "v0.4.24",
+    changedAt: "2026-08-31 12:49 EDT",
+    note: "Return to fast loading with a simple time table"
   };
 
   window.__MCG_TEE_PRESSURE_VERSION__ = VERSION;
@@ -445,6 +445,62 @@
       gap: 10px;
     }
 
+    .mcg-table-wrap {
+      border: 1px solid #dfe6dc;
+      border-radius: 8px;
+      overflow: auto;
+    }
+
+    .mcg-table {
+      border-collapse: collapse;
+      min-width: 460px;
+      width: 100%;
+    }
+
+    .mcg-table th {
+      background: #f8faf6;
+      color: #627168;
+      font-size: 11px;
+      font-weight: 900;
+      padding: 8px 10px;
+      position: sticky;
+      text-align: left;
+      text-transform: uppercase;
+      top: 0;
+      white-space: nowrap;
+      z-index: 1;
+    }
+
+    .mcg-table td {
+      border-top: 1px solid #edf1ea;
+      padding: 7px 10px;
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+
+    .mcg-table-row.best {
+      box-shadow: inset 3px 0 0 #2d7b55;
+    }
+
+    .mcg-table-row.unbookable {
+      background: #fbfcfa;
+    }
+
+    .mcg-table .mcg-fill {
+      justify-self: start;
+    }
+
+    .mcg-table-weather {
+      color: #3e4f46;
+      font-size: 13px;
+      font-weight: 900;
+    }
+
+    .mcg-table-action {
+      text-align: right;
+      width: 1%;
+    }
+
     .mcg-bucket {
       background: #ffffff;
       border: 1px solid #dfe6dc;
@@ -602,15 +658,6 @@
 
     .mcg-time.unbookable {
       background: #fbfcfa;
-    }
-
-    .mcg-time.inferred {
-      background: #fbfcfa;
-      color: #627168;
-    }
-
-    .mcg-time.inferred .mcg-time-clock {
-      color: #4f5f55;
     }
 
     .mcg-time.best {
@@ -923,7 +970,6 @@
     debugByCourse: new Map(),
     weatherByCourseDate: new Map(),
     bookingCourseByVanity: new Map(),
-    expandedBuckets: new Set(),
     error: "",
     root: null,
     shadow: null
@@ -1536,42 +1582,27 @@
     }
 
     var searchError = null;
-    var searchTimes = [];
-    var v4Times = [];
-
     try {
-      searchTimes = await loadSearchTimes(course, debug);
+      var searchTimes = await loadSearchTimes(course, debug);
+      if (searchTimes.length) {
+        debug.used = "TeeTimes/Search";
+        return searchTimes;
+      }
     } catch (error) {
       searchError = error;
       debug.search.error = error.message || "Search failed";
     }
 
-    var v4Error = null;
     try {
-      v4Times = await loadV4Times(course, debug);
-    } catch (error) {
-      v4Error = error;
-      debug.v4.error = error.message || "V4 lookup failed";
-    }
-
-    if (searchTimes.length && v4Times.length) {
-      debug.used = "TeeTimes/Search + BookingEngineV4/booking-times";
-      return mergeTimes(searchTimes, v4Times);
-    }
-
-    if (v4Times.length) {
+      var v4Times = await loadV4Times(course, debug);
       debug.used = "BookingEngineV4/booking-times";
-      return v4Times;
+      if (v4Times.length || !searchError) return v4Times;
+    } catch (error) {
+      debug.v4.error = error.message || "V4 lookup failed";
+      if (!searchError) throw error;
     }
 
-    if (searchTimes.length) {
-      debug.used = "TeeTimes/Search";
-      return searchTimes;
-    }
-
-    if (searchError) throw searchError;
-    if (v4Error) throw v4Error;
-    return [];
+    throw searchError;
   }
 
   function makeDebug(course, mode) {
@@ -1595,25 +1626,6 @@
   }
 
   async function loadSearchTimes(course, debug) {
-    var data = await loadSearchRows(course, 1);
-    var available = normalizeSearchRows(data, course);
-
-    if (debug) {
-      debug.search.raw = data.length;
-      debug.search.matched = available.length;
-      debug.search.available = available.length;
-      debug.search.thresholds = "1:" + available.length;
-      debug.sample = summarizeRaw(data.find(function (raw) { return matchesCourseVariant(raw, course); }) || data[0]);
-    }
-
-    if (available.some(function (slot) { return slot.assumedAvailability; })) {
-      available = await inferSearchAvailability(course, available, debug);
-    }
-
-    return available;
-  }
-
-  async function loadSearchRows(course, players) {
     var payload = await api("TeeTimes/Search", {
       recaptcha: true,
       action: "teetimes_search",
@@ -1621,56 +1633,23 @@
         golfCourseIds: course.id,
         dateFrom: state.date,
         dateTo: state.date + "T23:59:59",
-        players: players,
+        players: 1,
         holes: course.defaultHoles || 18
       }
     });
 
-    return Array.isArray(payload && payload.data) ? payload.data : Array.isArray(payload) ? payload : [];
-  }
+    var data = Array.isArray(payload && payload.data) ? payload.data : Array.isArray(payload) ? payload : [];
+    var matched = data.filter(function (raw) { return matchesCourseVariant(raw, course); });
+    var available = matched.map(function (raw) { return normalizeTime(raw, course); }).filter(function (slot) { return slot.timeText; });
 
-  function normalizeSearchRows(data, course) {
-    return data.filter(function (raw) { return matchesCourseVariant(raw, course); }).map(function (raw) {
-      return normalizeTime(raw, course);
-    }).filter(function (slot) { return slot.timeText; });
-  }
-
-  async function inferSearchAvailability(course, slots, debug) {
-    var presence = new Map();
-    slots.forEach(function (slot) {
-      presence.set(timeMergeKey(slot), 1);
-    });
-
-    for (var players = 2; players <= Math.min(4, course.maxPlayers || 4); players += 1) {
-      try {
-        var rows = await loadSearchRows(course, players);
-        var matched = normalizeSearchRows(rows, course);
-        if (debug) debug.search.thresholds += " / " + players + ":" + matched.length;
-
-        matched.forEach(function (slot) {
-          presence.set(timeMergeKey(slot), players);
-        });
-      } catch (error) {
-        if (debug) debug.search.thresholds += " / " + players + ":err";
-        break;
-      }
+    if (debug) {
+      debug.search.raw = data.length;
+      debug.search.matched = matched.length;
+      debug.search.available = available.length;
+      debug.sample = summarizeRaw(matched[0] || data[0]);
     }
 
-    return slots.map(function (slot) {
-      if (!slot.assumedAvailability) return slot;
-
-      var available = presence.get(timeMergeKey(slot)) || 1;
-      var maxPlayers = slot.maxPlayers || course.maxPlayers || 4;
-      var booked = Math.max(0, maxPlayers - available);
-
-      return Object.assign({}, slot, {
-        available: available,
-        booked: booked,
-        availabilitySource: "search-player-thresholds",
-        assumedAvailability: false,
-        pressure: maxPlayers ? booked / maxPlayers : 0
-      });
-    });
+    return available;
   }
 
   function matchesCourseVariant(raw, course) {
@@ -1725,44 +1704,6 @@
     return available;
   }
 
-  function mergeTimes(searchTimes, v4Times) {
-    var byKey = new Map();
-
-    searchTimes.concat(v4Times).forEach(function (slot) {
-      var key = timeMergeKey(slot);
-      var existing = byKey.get(key);
-      byKey.set(key, existing ? mergeSlot(existing, slot) : slot);
-    });
-
-    return Array.from(byKey.values());
-  }
-
-  function timeMergeKey(slot) {
-    if (slot.teeTimeId) return "id:" + slot.teeTimeId;
-    return ["time", slot.courseKey, slot.subCourseId || "", slotMinutes(slot), slot.back9 ? "back" : "front"].join(":");
-  }
-
-  function hasConcreteAvailability(slot) {
-    return slot.availabilitySource && slot.availabilitySource !== "assumed-search-row";
-  }
-
-  function mergeSlot(existing, next) {
-    var primary = hasConcreteAvailability(next) || !hasConcreteAvailability(existing) ? next : existing;
-    var secondary = primary === next ? existing : next;
-    var merged = Object.assign({}, secondary, primary);
-
-    merged.id = primary.id || secondary.id;
-    merged.teeTimeId = primary.teeTimeId || secondary.teeTimeId;
-    merged.subCourseId = primary.subCourseId || secondary.subCourseId;
-    merged.vanityName = primary.vanityName || secondary.vanityName;
-    merged.timeText = primary.timeText || secondary.timeText;
-    merged.rawTime = primary.rawTime || secondary.rawTime;
-    merged.price = primary.price ?? secondary.price;
-    merged.holes = primary.holes || secondary.holes;
-
-    return merged;
-  }
-
   function sortedTimes(times) {
     var list = times.slice();
     list.sort(compareSlots);
@@ -1779,7 +1720,6 @@
   }
 
   function slotPressure(slot) {
-    if (slot.inferred) return null;
     return slot.maxPlayers ? slot.booked / slot.maxPlayers : 1;
   }
 
@@ -1806,94 +1746,6 @@
     return hours * 60 + minutes;
   }
 
-  function formatMinutes(minutes) {
-    var normalized = (minutes + 1440) % 1440;
-    var hours = Math.floor(normalized / 60);
-    var mins = normalized % 60;
-    var suffix = hours >= 12 ? "PM" : "AM";
-    var displayHours = hours % 12 || 12;
-    return displayHours + ":" + String(mins).padStart(2, "0") + " " + suffix;
-  }
-
-  function timeISOForMinutes(minutes) {
-    var normalized = (minutes + 1440) % 1440;
-    var hours = Math.floor(normalized / 60);
-    var mins = normalized % 60;
-    return state.date + "T" + String(hours).padStart(2, "0") + ":" + String(mins).padStart(2, "0") + ":00";
-  }
-
-  function inferredCadence(times) {
-    var counts = {};
-    var best = 0;
-    var bestCount = 0;
-
-    for (var index = 1; index < times.length; index += 1) {
-      var diff = slotMinutes(times[index]) - slotMinutes(times[index - 1]);
-      if (diff < 5 || diff > 30) continue;
-
-      var rounded = Math.max(5, Math.round(diff / 5) * 5);
-      counts[rounded] = (counts[rounded] || 0) + 1;
-
-      if (counts[rounded] > bestCount) {
-        best = rounded;
-        bestCount = counts[rounded];
-      }
-    }
-
-    return best || 10;
-  }
-
-  function makeInferredSlot(template, minutes) {
-    return {
-      id: ["gap", template.courseKey, state.date, minutes].join("-"),
-      teeTimeId: null,
-      courseKey: template.courseKey,
-      subCourseId: template.subCourseId,
-      courseLabel: template.courseLabel,
-      fullName: template.fullName,
-      subCourseName: template.subCourseName,
-      vanityName: template.vanityName,
-      timeText: formatMinutes(minutes),
-      rawTime: timeISOForMinutes(minutes),
-      available: 0,
-      booked: 0,
-      maxPlayers: 0,
-      holes: template.holes,
-      price: null,
-      availabilitySource: "not-returned",
-      assumedAvailability: false,
-      pressure: null,
-      back9: template.back9,
-      inferred: true
-    };
-  }
-
-  function withInferredMissingSlots(times) {
-    var list = times.slice();
-    var real = list.filter(function (slot) { return !slot.inferred && slot.timeText; }).sort(compareSlotTimes);
-    if (real.length < 2) return list;
-
-    var cadence = inferredCadence(real);
-    var existing = new Set(real.map(function (slot) { return String(slotMinutes(slot)); }));
-    var inferred = [];
-
-    for (var index = 1; index < real.length; index += 1) {
-      var previous = slotMinutes(real[index - 1]);
-      var current = slotMinutes(real[index]);
-      var gap = current - previous;
-
-      if (gap <= cadence || gap > 90) continue;
-
-      for (var minutes = previous + cadence; minutes < current; minutes += cadence) {
-        if (existing.has(String(minutes))) continue;
-        existing.add(String(minutes));
-        inferred.push(makeInferredSlot(real[index - 1], minutes));
-      }
-    }
-
-    return list.concat(inferred);
-  }
-
   function priceNumber(value) {
     if (value === null || value === undefined || value === "") return null;
     if (typeof value === "number") return Number.isFinite(value) ? value : null;
@@ -1908,69 +1760,6 @@
 
     var rounded = Math.round(price * 100) / 100;
     return "$" + (Math.abs(rounded % 1) < 0.005 ? String(Math.round(rounded)) : rounded.toFixed(2));
-  }
-
-  function bucketPrice(bucket) {
-    var prices = bucket.times.map(function (slot) { return priceNumber(slot.price); }).filter(function (price) { return price !== null; });
-    if (!prices.length) return "";
-
-    var min = Math.min.apply(Math, prices);
-    var max = Math.max.apply(Math, prices);
-    if (Math.abs(max - min) < 0.005) return formatPrice(min);
-    return formatPrice(min) + "-" + formatPrice(max);
-  }
-
-  function bucketTimes(times) {
-    var buckets = new Map();
-
-    times.forEach(function (slot) {
-      var start = Math.floor(slotMinutes(slot) / 30) * 30;
-      var key = String(start);
-      var bucket = buckets.get(key);
-
-      if (!bucket) {
-        bucket = {
-          start: start,
-          label: formatMinutes(start) + "-" + formatMinutes(start + 30),
-          times: [],
-          booked: 0,
-          open: 0,
-          capacity: 0,
-          assumed: true
-        };
-        buckets.set(key, bucket);
-      }
-
-      bucket.times.push(slot);
-      if (slot.inferred) {
-        bucket.hasInferred = true;
-        return;
-      }
-
-      bucket.booked += slot.booked;
-      bucket.open += slot.available;
-      bucket.capacity += slot.maxPlayers;
-      bucket.assumed = bucket.assumed && slot.assumedAvailability;
-    });
-
-    var groups = Array.from(buckets.values());
-    groups.forEach(function (bucket) {
-      bucket.times.sort(compareSlotTimes);
-      bucket.assumed = bucket.capacity > 0 && bucket.assumed;
-      bucket.pressure = bucket.capacity ? bucket.booked / bucket.capacity : null;
-      bucket.price = bucketPrice(bucket);
-    });
-
-    groups.sort(function (a, b) {
-      if (state.sort === "score") return bucketPressureSort(a) - bucketPressureSort(b) || a.booked - b.booked || b.open - a.open || a.start - b.start;
-      return a.start - b.start;
-    });
-
-    return groups;
-  }
-
-  function bucketPressureSort(bucket) {
-    return bucket.pressure == null ? 2 : bucket.pressure;
   }
 
   function selectedCourse() {
@@ -1992,7 +1781,7 @@
 
   function render() {
     var course = selectedCourse();
-    var times = sortedTimes(withInferredMissingSlots(selectedTimes()));
+    var times = sortedTimes(selectedTimes());
 
     state.shadow.innerHTML = [
       "<style>", STYLE, "</style>",
@@ -2127,38 +1916,25 @@
 
   function renderTimes(course, times) {
     var title = course ? course.label : "Course";
-    var cards = times.length ? bucketTimes(times).map(function (bucket) { return renderBucket(bucket, course); }).join("") : renderEmpty(course);
+    var content = times.length ? renderTimeTable(course, times) : renderEmpty(course);
     return [
       '<section>',
       '<div class="mcg-section-head"><div>',
       '<div class="mcg-section-title">', escapeHTML(title), "</div>",
-      '<div class="mcg-section-note">Tap a time window to expand.</div>',
       "</div></div>",
-      '<div class="mcg-times">', cards, "</div>",
+      '<div class="mcg-times">', content, "</div>",
       "</section>"
     ].join("");
   }
 
-  function renderBucket(bucket, course) {
-    var best = bucket.capacity > 0 && bucket.booked === 0;
-    var key = [state.selectedKey, state.date, bucket.start].join(":");
-    var expanded = state.expandedBuckets.has(key);
-    var assumed = bucket.assumed ? "*" : "";
-    var weather = bucketWeather(course, bucket);
-
+  function renderTimeTable(course, times) {
     return [
-      '<section class="mcg-bucket', best ? " best" : "", expanded ? " expanded" : "", '">',
-      '<button type="button" class="mcg-bucket-head" data-bucket="', escapeHTML(key), '" aria-expanded="', expanded ? "true" : "false", '">',
-      '<div class="mcg-bucket-title"><span>', escapeHTML(bucket.label), "</span>", bucket.price ? '<span class="mcg-bucket-price">' + escapeHTML(bucket.price) + "</span>" : "", "</div>",
-      '<div class="mcg-temp" title="', escapeHTML(weather.title || "hourly weather"), '">', escapeHTML(weather.label), "</div>",
-      renderFill(bucket.booked, bucket.capacity, bucket.pressure, assumed, ""),
-      '<div class="mcg-chevron">›</div>',
-      "</button>",
-      expanded ? [
-      '<div class="mcg-bucket-rows">',
-      bucket.times.map(renderTimeCard).join(""),
-      "</div></section>"
-      ].join("") : "</section>"
+      '<div class="mcg-table-wrap">',
+      '<table class="mcg-table">',
+      '<thead><tr><th>Time</th><th>Booked</th><th>Price</th><th>Weather</th><th></th></tr></thead>',
+      '<tbody>',
+      times.map(function (slot) { return renderTimeRow(slot, course); }).join(""),
+      "</tbody></table></div>"
     ].join("");
   }
 
@@ -2171,7 +1947,6 @@
         '<div class="mcg-debug">',
         escapeHTML(debug.version), " · ", escapeHTML(debug.changedAt), "<br>",
         "Search raw ", escapeHTML(debugText(debug.search.raw)), " / matched ", escapeHTML(debugText(debug.search.matched)), " / available ", escapeHTML(debugText(debug.search.available)),
-        debug.search.thresholds ? "<br>Search thresholds " + escapeHTML(debug.search.thresholds) : "",
         debug.search.error ? "<br>Search error: " + escapeHTML(debug.search.error) : "",
         "<br>V4 raw ", escapeHTML(debugText(debug.v4.raw)), " / matched ", escapeHTML(debugText(debug.v4.matched)), " / available ", escapeHTML(debugText(debug.v4.available)),
         debug.v4.error ? "<br>V4 error: " + escapeHTML(debug.v4.error) : "",
@@ -2189,31 +1964,37 @@
     ].join("");
   }
 
-  function renderTimeCard(slot) {
-    if (slot.inferred) {
+  function renderTimeRow(slot, course) {
+    var canBook = slot.available >= state.players;
+    var bookUrl = canBook ? bookingUrl(slot) : "";
+    var unbookableLabel = slot.available <= 0 ? "Full" : slot.available + " left";
+    var weather = bucketWeather(course, { start: slotMinutes(slot) });
+    var price = formatPrice(slot.price) || "-";
+    var best = !slot.assumedAvailability && slot.booked === 0;
+
+    return [
+      '<tr class="mcg-table-row', best ? " best" : "", canBook ? "" : " unbookable", '">',
+      '<td><span class="mcg-time-clock">', escapeHTML(slot.timeText), "</span></td>",
+      '<td>', renderSlotFill(slot), "</td>",
+      '<td><span class="mcg-price">', escapeHTML(price), "</span></td>",
+      '<td><span class="mcg-table-weather" title="', escapeHTML(weather.title || "hourly weather"), '">', escapeHTML(weather.label || "-"), "</span></td>",
+      '<td class="mcg-table-action">',
+      bookUrl ? '<a class="mcg-link" href="' + escapeHTML(bookUrl) + '" data-book-slot="' + escapeHTML(slot.id) + '">Book</a>' : '<span class="mcg-micro" title="' + escapeHTML("Only " + slot.available + " open") + '">' + escapeHTML(unbookableLabel) + "</span>",
+      "</td></tr>"
+    ].join("");
+  }
+
+  function renderSlotFill(slot) {
+    if (slot.assumedAvailability) {
       return [
-        '<article class="mcg-time inferred" title="TenFore did not return this tee time; it may be full, blocked, skipped, or not offered.">',
-        '<div class="mcg-time-clock">', escapeHTML(slot.timeText), '</div>',
-        '<div class="mcg-price"></div>',
-        renderFill(slot.booked, slot.maxPlayers, null, "", " mcg-time-fill"),
-        '<span class="mcg-micro">-</span>',
-        "</article>"
+        '<div class="mcg-fill low" title="TenFore returned this slot but did not include a player count">',
+        '<span class="mcg-fill-dot"></span>',
+        "<strong>Open</strong>",
+        "</div>"
       ].join("");
     }
 
-    var canBook = slot.available >= state.players;
-    var bookUrl = canBook ? bookingUrl(slot) : "";
-    var source = slot.assumedAvailability ? "*" : "";
-    var unbookableLabel = slot.available <= 0 ? "Full" : slot.available + " left";
-
-    return [
-      '<article class="mcg-time', canBook ? "" : " unbookable", '">',
-      '<div class="mcg-time-clock">', escapeHTML(slot.timeText), '</div>',
-      '<div class="mcg-price">', escapeHTML(formatPrice(slot.price)), "</div>",
-      renderFill(slot.booked, slot.maxPlayers, slotPressure(slot), source, " mcg-time-fill"),
-      bookUrl ? '<a class="mcg-link" href="' + escapeHTML(bookUrl) + '" data-book-slot="' + escapeHTML(slot.id) + '">Book</a>' : '<span class="mcg-micro" title="' + escapeHTML("Only " + slot.available + " open") + '">' + escapeHTML(unbookableLabel) + "</span>",
-      "</article>"
-    ].join("");
+    return renderFill(slot.booked, slot.maxPlayers, slotPressure(slot), "", "");
   }
 
   function renderFill(booked, capacity, pressure, suffix, extraClass) {
@@ -2361,7 +2142,6 @@
     state.timesByCourse.clear();
     state.debugByCourse.clear();
     state.weatherByCourseDate.clear();
-    state.expandedBuckets.clear();
     await ensureSelectedTimes();
   }
 
@@ -2409,18 +2189,6 @@
         if (event.key === "Enter") players.blur();
       });
     }
-
-    state.shadow.querySelectorAll("[data-bucket]").forEach(function (button) {
-      button.addEventListener("click", function () {
-        var key = button.dataset.bucket;
-        if (state.expandedBuckets.has(key)) {
-          state.expandedBuckets.delete(key);
-        } else {
-          state.expandedBuckets.add(key);
-        }
-        render();
-      });
-    });
 
     state.shadow.querySelectorAll("[data-book-slot]").forEach(function (link) {
       link.addEventListener("click", async function (event) {
