@@ -11,9 +11,9 @@
   };
 
   var VERSION = {
-    id: "v0.4.21",
-    changedAt: "2026-08-31 12:25 EDT",
-    note: "Show inferred skipped slots and safer date picking"
+    id: "v0.4.22",
+    changedAt: "2026-08-31 12:37 EDT",
+    note: "Merge V4 full-slot data and clarify unbookable rows"
   };
 
   window.__MCG_TEE_PRESSURE_VERSION__ = VERSION;
@@ -1536,27 +1536,42 @@
     }
 
     var searchError = null;
+    var searchTimes = [];
+    var v4Times = [];
+
     try {
-      var searchTimes = await loadSearchTimes(course, debug);
-      if (searchTimes.length) {
-        debug.used = "TeeTimes/Search";
-        return searchTimes;
-      }
+      searchTimes = await loadSearchTimes(course, debug);
     } catch (error) {
       searchError = error;
       debug.search.error = error.message || "Search failed";
     }
 
+    var v4Error = null;
     try {
-      var v4Times = await loadV4Times(course, debug);
-      debug.used = "BookingEngineV4/booking-times";
-      if (v4Times.length || !searchError) return v4Times;
+      v4Times = await loadV4Times(course, debug);
     } catch (error) {
+      v4Error = error;
       debug.v4.error = error.message || "V4 lookup failed";
-      if (!searchError) throw error;
     }
 
-    throw searchError;
+    if (searchTimes.length && v4Times.length) {
+      debug.used = "TeeTimes/Search + BookingEngineV4/booking-times";
+      return mergeTimes(searchTimes, v4Times);
+    }
+
+    if (v4Times.length) {
+      debug.used = "BookingEngineV4/booking-times";
+      return v4Times;
+    }
+
+    if (searchTimes.length) {
+      debug.used = "TeeTimes/Search";
+      return searchTimes;
+    }
+
+    if (searchError) throw searchError;
+    if (v4Error) throw v4Error;
+    return [];
   }
 
   function makeDebug(course, mode) {
@@ -1656,6 +1671,44 @@
     }
 
     return available;
+  }
+
+  function mergeTimes(searchTimes, v4Times) {
+    var byKey = new Map();
+
+    searchTimes.concat(v4Times).forEach(function (slot) {
+      var key = timeMergeKey(slot);
+      var existing = byKey.get(key);
+      byKey.set(key, existing ? mergeSlot(existing, slot) : slot);
+    });
+
+    return Array.from(byKey.values());
+  }
+
+  function timeMergeKey(slot) {
+    if (slot.teeTimeId) return "id:" + slot.teeTimeId;
+    return ["time", slot.courseKey, slot.subCourseId || "", slotMinutes(slot), slot.back9 ? "back" : "front"].join(":");
+  }
+
+  function hasConcreteAvailability(slot) {
+    return slot.availabilitySource && slot.availabilitySource !== "assumed-search-row";
+  }
+
+  function mergeSlot(existing, next) {
+    var primary = hasConcreteAvailability(next) || !hasConcreteAvailability(existing) ? next : existing;
+    var secondary = primary === next ? existing : next;
+    var merged = Object.assign({}, secondary, primary);
+
+    merged.id = primary.id || secondary.id;
+    merged.teeTimeId = primary.teeTimeId || secondary.teeTimeId;
+    merged.subCourseId = primary.subCourseId || secondary.subCourseId;
+    merged.vanityName = primary.vanityName || secondary.vanityName;
+    merged.timeText = primary.timeText || secondary.timeText;
+    merged.rawTime = primary.rawTime || secondary.rawTime;
+    merged.price = primary.price ?? secondary.price;
+    merged.holes = primary.holes || secondary.holes;
+
+    return merged;
   }
 
   function sortedTimes(times) {
@@ -2098,13 +2151,14 @@
     var canBook = slot.available >= state.players;
     var bookUrl = canBook ? bookingUrl(slot) : "";
     var source = slot.assumedAvailability ? "*" : "";
+    var unbookableLabel = slot.available <= 0 ? "Full" : slot.available + " left";
 
     return [
       '<article class="mcg-time', canBook ? "" : " unbookable", '">',
       '<div class="mcg-time-clock">', escapeHTML(slot.timeText), '</div>',
       '<div class="mcg-price">', escapeHTML(formatPrice(slot.price)), "</div>",
       renderFill(slot.booked, slot.maxPlayers, slotPressure(slot), source, " mcg-time-fill"),
-      bookUrl ? '<a class="mcg-link" href="' + escapeHTML(bookUrl) + '" data-book-slot="' + escapeHTML(slot.id) + '">Book</a>' : '<span class="mcg-micro" title="' + escapeHTML("Only " + slot.available + " open") + '">-</span>',
+      bookUrl ? '<a class="mcg-link" href="' + escapeHTML(bookUrl) + '" data-book-slot="' + escapeHTML(slot.id) + '">Book</a>' : '<span class="mcg-micro" title="' + escapeHTML("Only " + slot.available + " open") + '">' + escapeHTML(unbookableLabel) + "</span>",
       "</article>"
     ].join("");
   }
@@ -2114,7 +2168,7 @@
       return [
         '<div class="mcg-fill unknown', escapeHTML(extraClass || ""), '" title="Not returned by TenFore">',
         '<span class="mcg-fill-dot"></span>',
-        '<strong>?</strong>',
+        '<strong>--</strong>',
         "</div>"
       ].join("");
     }
