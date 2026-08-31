@@ -4,6 +4,8 @@
   var CONFIG = {
     apiRoot: "https://swan.tenfore.golf/api",
     weatherRoot: "https://api.open-meteo.com/v1/forecast",
+    weatherGovRoot: "https://api.weather.gov",
+    weatherTimeoutMs: 2500,
     appId: 23,
     vanityName: "mcggolf",
     siteKey: "6LfAN9ksAAAAAFxnXFLRCuU9gUXs6U6egm6TrjIn",
@@ -11,9 +13,9 @@
   };
 
   var VERSION = {
-    id: "v0.4.24",
-    changedAt: "2026-08-31 12:49 EDT",
-    note: "Return to fast loading with a simple time table"
+    id: "v0.4.25",
+    changedAt: "2026-08-31 15:15 EDT",
+    note: "Restore count pills and emoji weather in the table"
   };
 
   window.__MCG_TEE_PRESSURE_VERSION__ = VERSION;
@@ -1426,7 +1428,29 @@
     return courseKey(course) + ":" + state.date;
   }
 
+  async function fetchJSONWithTimeout(url, options, timeoutMs) {
+    var controller = new AbortController();
+    var timer = window.setTimeout(function () { controller.abort(); }, timeoutMs || CONFIG.weatherTimeoutMs);
+
+    try {
+      var request = Object.assign({ credentials: "omit" }, options || {}, { signal: controller.signal });
+      var response = await fetch(url.toString(), request);
+      if (!response.ok) throw new Error("Weather lookup failed.");
+      return response.json();
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
   async function loadWeather(course) {
+    try {
+      return await loadOpenMeteoWeather(course);
+    } catch (error) {
+      return loadWeatherGov(course);
+    }
+  }
+
+  async function loadOpenMeteoWeather(course) {
     var range = selectedDateInNextSeven() ? nextSevenRange() : { start: state.date, end: state.date };
     var url = new URL(CONFIG.weatherRoot);
     url.searchParams.set("latitude", course.weatherLat || COURSE_COORDS.fallback.lat);
@@ -1439,10 +1463,7 @@
     url.searchParams.set("start_date", range.start);
     url.searchParams.set("end_date", range.end);
 
-    var response = await fetch(url.toString(), { credentials: "omit" });
-    if (!response.ok) throw new Error("Weather lookup failed.");
-
-    var payload = await response.json();
+    var payload = await fetchJSONWithTimeout(url, null, CONFIG.weatherTimeoutMs);
     var times = payload.hourly && Array.isArray(payload.hourly.time) ? payload.hourly.time : [];
     var temps = payload.hourly && Array.isArray(payload.hourly.temperature_2m) ? payload.hourly.temperature_2m : [];
     var probabilities = payload.hourly && Array.isArray(payload.hourly.precipitation_probability) ? payload.hourly.precipitation_probability : [];
@@ -1481,6 +1502,73 @@
     };
   }
 
+  async function loadWeatherGov(course) {
+    var lat = course.weatherLat || COURSE_COORDS.fallback.lat;
+    var lon = course.weatherLon || COURSE_COORDS.fallback.lon;
+    var pointUrl = new URL(CONFIG.weatherGovRoot + "/points/" + lat + "," + lon);
+    var point = await fetchJSONWithTimeout(pointUrl, { headers: { Accept: "application/geo+json" } }, CONFIG.weatherTimeoutMs);
+    var hourlyUrl = point && point.properties && point.properties.forecastHourly;
+    if (!hourlyUrl) throw new Error("Weather lookup failed.");
+
+    var payload = await fetchJSONWithTimeout(hourlyUrl, { headers: { Accept: "application/geo+json" } }, CONFIG.weatherTimeoutMs);
+    var periods = payload && payload.properties && Array.isArray(payload.properties.periods) ? payload.properties.periods : [];
+    var hours = {};
+    var days = {};
+
+    periods.forEach(function (period) {
+      var hourKey = weatherHourKey(period.startTime);
+      var dayKey = hourKey.slice(0, 10);
+      var temp = numberFrom(period.temperature);
+      var probability = period.probabilityOfPrecipitation ? numberFrom(period.probabilityOfPrecipitation.value) : null;
+      var icon = weatherEmojiFromText(period.shortForecast || "");
+      var rainy = /rain|shower|storm|drizzle|sleet|snow/i.test(period.shortForecast || "") || probability >= 50;
+
+      hours[hourKey] = {
+        temp: temp,
+        precipitationProbability: probability,
+        precipitation: null,
+        weatherCode: null,
+        icon: icon,
+        weatherText: period.shortForecast || "",
+        rainy: rainy
+      };
+
+      if (!days[dayKey]) days[dayKey] = { weatherCode: null, high: null, low: null, icon: icon };
+      if (temp != null) {
+        days[dayKey].high = days[dayKey].high == null ? temp : Math.max(days[dayKey].high, temp);
+        days[dayKey].low = days[dayKey].low == null ? temp : Math.min(days[dayKey].low, temp);
+      }
+      if (!days[dayKey].icon || /rain|shower|storm|drizzle|sleet|snow/i.test(period.shortForecast || "")) {
+        days[dayKey].icon = icon;
+      }
+    });
+
+    return {
+      hours: hours,
+      days: days,
+      unit: "°F"
+    };
+  }
+
+  function weatherHourKey(value) {
+    var date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value || "").slice(0, 13) + ":00";
+
+    var parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      hourCycle: "h23"
+    }).formatToParts(date).reduce(function (memo, part) {
+      memo[part.type] = part.value;
+      return memo;
+    }, {});
+
+    return parts.year + "-" + parts.month + "-" + parts.day + "T" + parts.hour + ":00";
+  }
+
   async function ensureWeather(course) {
     var key = weatherKey(course);
     if (state.weatherByCourseDate.has(key)) return;
@@ -1506,20 +1594,22 @@
     if (!hour) return { label: "", title: "" };
 
     var temp = hour.temp == null ? "" : Math.round(hour.temp) + "°";
-    var probability = Number(hour.precipitationProbability);
-    var amount = Number(hour.precipitation);
+    var probability = numberFrom(hour.precipitationProbability);
+    var amount = numberFrom(hour.precipitation);
     var code = Number(hour.weatherCode);
-    var rainy = isRainyWeather(code) || amount > 0.01 || probability >= 50;
-    var rainText = rainy ? "rain" : probability >= 25 ? Math.round(probability) + "%" : "dry";
+    var rainy = !!hour.rainy || isRainyWeather(code) || amount > 0.01 || probability >= 50;
+    var rainText = rainy ? "rain" : probability != null && probability >= 25 ? Math.round(probability) + "%" : "dry";
+    var icon = hour.icon || (Number.isFinite(code) ? weatherIcon(code) : "");
     var title = [
       temp || "temperature unavailable",
-      Number.isFinite(probability) ? Math.round(probability) + "% precip" : "",
-      Number.isFinite(amount) ? amount + " in" : "",
+      probability != null ? Math.round(probability) + "% precip" : "",
+      amount != null ? amount + " in" : "",
+      hour.weatherText || "",
       Number.isFinite(code) ? "code " + code : ""
     ].filter(Boolean).join(" · ");
 
     return {
-      label: [temp, rainText].filter(Boolean).join(" "),
+      label: [icon, temp, rainText].filter(Boolean).join(" "),
       title: title
     };
   }
@@ -1537,6 +1627,15 @@
     return "☀️";
   }
 
+  function weatherEmojiFromText(text) {
+    if (/thunder|storm/i.test(text)) return "⛈️";
+    if (/snow|sleet|ice|freezing/i.test(text)) return "❄️";
+    if (/rain|shower|drizzle/i.test(text)) return "🌧️";
+    if (/fog|mist|haze/i.test(text)) return "🌫️";
+    if (/cloud|overcast/i.test(text)) return "☁️";
+    return "☀️";
+  }
+
   function dayWeather(course, value) {
     var forecast = course ? state.weatherByCourseDate.get(weatherKey(course)) : null;
     var day = forecast && forecast.days ? forecast.days[value] : null;
@@ -1548,9 +1647,11 @@
     var high = day.high == null ? "" : Math.round(day.high);
     var low = day.low == null ? "" : Math.round(day.low);
     var temps = high === "" || low === "" ? "" : high + "/" + low;
+    var code = Number(day.weatherCode);
+    var icon = day.icon || (Number.isFinite(code) ? weatherIcon(code) : "");
 
     return {
-      icon: weatherIcon(Number(day.weatherCode)),
+      icon: icon,
       text: temps
     };
   }
@@ -1985,15 +2086,6 @@
   }
 
   function renderSlotFill(slot) {
-    if (slot.assumedAvailability) {
-      return [
-        '<div class="mcg-fill low" title="TenFore returned this slot but did not include a player count">',
-        '<span class="mcg-fill-dot"></span>',
-        "<strong>Open</strong>",
-        "</div>"
-      ].join("");
-    }
-
     return renderFill(slot.booked, slot.maxPlayers, slotPressure(slot), "", "");
   }
 
@@ -2258,8 +2350,13 @@
     if (!course) return render();
     var key = requestKey(course);
     if (state.timesByCourse.has(key)) {
-      if (!state.weatherByCourseDate.has(weatherKey(course))) await ensureWeather(course);
-      return render();
+      render();
+      if (!state.weatherByCourseDate.has(weatherKey(course))) {
+        ensureWeather(course).then(function () {
+          render();
+        });
+      }
+      return;
     }
 
     state.loading = true;
@@ -2269,6 +2366,8 @@
     try {
       var weather = ensureWeather(course);
       state.timesByCourse.set(key, await loadTimes(course));
+      state.loading = false;
+      render();
       await weather;
     } catch (error) {
       state.error = error.message || "Could not load tee times.";
