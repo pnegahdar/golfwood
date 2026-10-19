@@ -228,8 +228,39 @@ test('captcha execution has a deadline, rejects empty tokens, and never starts A
   assert.ok(debug.search.error);
   assert.equal(debug.v4.error, '', 'both endpoints need the same failed verification');
   captcha(h, 'current-key', true, async () => '  ');
-  await assert.rejects(h.app.recaptchaToken('teetimes_search'), error => error.code === 'CAPTCHA_EMPTY');
+  const emptyCheck = assert.rejects(h.app.recaptchaToken('teetimes_search'), error => error.code === 'CAPTCHA_EMPTY');
+  await flush();
+  h.advance(1000);
+  await emptyCheck;
   assert.equal(calls, 0);
+});
+
+test('a transient empty token at page startup retries once after a pause without API fallback', async () => {
+  for (const empty of ['', undefined]) {
+    const h = harness();
+    select(h);
+    let executions = 0, requests = 0;
+    captcha(h, 'current-key', true, async () => ++executions === 1 ? empty : 'recovered-token');
+    h.fetch(async (url, options) => {
+      requests++;
+      assert.match(url, /TeeTimes\/Search/);
+      assert.equal(options.headers.get('X-Recaptcha-Token'), 'recovered-token');
+      return response({ data: [rawSlot('2026-10-20')] });
+    });
+    const pending = h.app.loadTimes(courseA);
+    await flush();
+    assert.equal(requests, 0);
+    assert.equal(executions, 1);
+    h.advance(999);
+    await flush();
+    assert.equal(executions, 1);
+    h.advance(1);
+    const times = await pending;
+    assert.equal(times.length, 1);
+    assert.equal(executions, 2);
+    assert.equal(requests, 1);
+    assert.equal(h.timers.size, 0);
+  }
 });
 
 test('each API call gets a new token and sends the current V4 action', async () => {

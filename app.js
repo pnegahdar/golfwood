@@ -12,9 +12,9 @@
   };
 
   var VERSION = {
-    id: "v0.4.26",
+    id: "v0.4.27",
     changedAt: "2026-10-19",
-    note: "Repair verification, availability recovery, and booking handoff"
+    note: "Recover verification during page startup and refresh preview assets"
   };
 
   window.__MCG_TEE_PRESSURE_VERSION__ = VERSION;
@@ -1526,6 +1526,14 @@
       var token = await withTimeout(Promise.resolve().then(function () {
         return api.execute(siteKey, { action: action });
       }), 10000, lookupError("CAPTCHA_TIMEOUT", "Verification took too long. Retry, or use TenFore directly."));
+      // TenFore may still be verifying its own initial search when the overlay opens.
+      // An empty result can be transient; give that request time to finish, then retry once.
+      if (typeof token !== "string" || !token.trim()) {
+        await new Promise(function (resolve) { window.setTimeout(resolve, 1000); });
+        token = await withTimeout(Promise.resolve().then(function () {
+          return api.execute(siteKey, { action: action });
+        }), 10000, lookupError("CAPTCHA_TIMEOUT", "Verification took too long. Retry, or use TenFore directly."));
+      }
       if (typeof token !== "string" || !token.trim()) {
         throw lookupError("CAPTCHA_EMPTY", "Verification didn’t complete. Retry, or use TenFore directly.");
       }
