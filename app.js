@@ -8,14 +8,13 @@
     weatherTimeoutMs: 2500,
     appId: 23,
     vanityName: "mcggolf",
-    siteKey: "6LfAN9ksAAAAAFxnXFLRCuU9gUXs6U6egm6TrjIn",
     host: "fox.tenfore.golf"
   };
 
   var VERSION = {
-    id: "v0.4.25",
-    changedAt: "2026-08-31 15:15 EDT",
-    note: "Restore count pills and emoji weather in the table"
+    id: "v0.4.26",
+    changedAt: "2026-10-19",
+    note: "Repair verification, availability recovery, and booking handoff"
   };
 
   window.__MCG_TEE_PRESSURE_VERSION__ = VERSION;
@@ -790,6 +789,19 @@
       padding: 8px 10px;
       text-align: left;
       width: 100%;
+      overflow-wrap: anywhere;
+    }
+
+    .mcg-debug summary {
+      cursor: pointer;
+      font-weight: 800;
+    }
+
+    .mcg-recovery-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
     }
 
     .mcg-spinner {
@@ -970,8 +982,18 @@
     showCustomDate: false,
     timesByCourse: new Map(),
     debugByCourse: new Map(),
+    errorsByCourse: new Map(),
+    requestsByCourse: new Map(),
     weatherByCourseDate: new Map(),
+    weatherRequests: new Map(),
     bookingCourseByVanity: new Map(),
+    bookingSlotId: "",
+    bookingError: "",
+    bookingFallbackUrl: "",
+    coursesError: null,
+    coursesLoading: false,
+    coursesRequest: null,
+    disposed: false,
     error: "",
     root: null,
     shadow: null
@@ -982,6 +1004,7 @@
   }
 
   window.__mcgTeePressureCleanup = function () {
+    state.disposed = true;
     var old = document.getElementById("mcg-tee-pressure-root");
     if (old) old.remove();
     var preview = document.getElementById("mcg-preview-root");
@@ -1092,8 +1115,9 @@
     };
   }
 
-  function selectedDateInNextSeven() {
-    return nextSevenChoices().some(function (choice) { return choice.value === state.date; });
+  function selectedDateInNextSeven(date) {
+    date = date || state.date;
+    return nextSevenChoices().some(function (choice) { return choice.value === date; });
   }
 
   function shortCourseName(name) {
@@ -1104,8 +1128,8 @@
     return course.id + ":" + (course.subCourseId || 0);
   }
 
-  function requestKey(course) {
-    return [courseKey(course), state.date].join(":");
+  function requestKey(course, date) {
+    return [courseKey(course), date || state.date].join(":");
   }
 
   function withCourseCoords(course) {
@@ -1190,6 +1214,9 @@
     if (customers != null) {
       return { value: maxPlayers - customers, source: "customers" };
     }
+
+    var booked = firstNumber(raw, ["bookedPlayers", "customerCount", "playerCount", "booked", "reservedPlayers"]);
+    if (booked) return { value: maxPlayers - booked.value, source: booked.source };
 
     var fallback = firstNumber(raw, ["available"]);
     if (fallback) return fallback;
@@ -1314,6 +1341,7 @@
     return {
       id: teeTimeId || [courseKey(course), dateScheduled, raw.teeSheetTimeID || ""].join("-"),
       teeTimeId: teeTimeId,
+      courseId: course.id,
       courseKey: courseKey(course),
       subCourseId: rawSubCourseId,
       courseLabel: course.label,
@@ -1334,35 +1362,179 @@
     };
   }
 
-  async function ensureRecaptcha() {
-    if (window.grecaptcha && (window.grecaptcha.enterprise || window.grecaptcha).execute) return;
+  function lookupError(code, message, diagnostic) {
+    var error = new Error(message);
+    error.name = code.indexOf("CAPTCHA_") === 0 ? "CaptchaError" : "AvailabilityError";
+    error.code = code;
+    error.diagnostic = diagnostic || "";
+    return error;
+  }
 
-    await new Promise(function (resolve, reject) {
-      var existing = document.querySelector("script[data-mcg-recaptcha]");
-      if (existing) {
-        existing.addEventListener("load", resolve, { once: true });
-        existing.addEventListener("error", reject, { once: true });
-        return;
-      }
-      var script = document.createElement("script");
-      script.src = "https://www.google.com/recaptcha/enterprise.js?render=" + encodeURIComponent(CONFIG.siteKey);
+  function errorDetails(error) {
+    return error && (error.diagnostic || error.message) || String(error || "Unknown error");
+  }
+
+  function availabilityMessage(error) {
+    return error && (error.name === "AvailabilityError" || error.name === "CaptchaError") ? error.message : "Couldn’t reach TenFore. Check your connection and try again.";
+  }
+
+  function captchaScriptInfo(script) {
+    try {
+      var url = new URL(script.src, location.href);
+      var match = url.pathname.match(/^\/recaptcha\/(enterprise|api)\.js$/);
+      var key = url.searchParams.get("render");
+      if (!/^(www\.)?(google\.com|recaptcha\.net)$/.test(url.hostname) || !match || !key || key === "explicit" || key === "onload") return null;
+      return { script: script, key: key, enterprise: match[1] === "enterprise" };
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function captchaScripts() {
+    return Array.from(document.querySelectorAll("script[src]")).map(captchaScriptInfo).filter(Boolean);
+  }
+
+  function recaptchaSiteKey() {
+    var config = window.__NUXT__ && window.__NUXT__.config;
+    var key = config && config.public && config.public.recaptchaPolicySiteKey;
+    if (typeof key === "string" && key.trim()) return key.trim();
+
+    var app = tenForeApp();
+    var globals = app && app.config && app.config.globalProperties;
+    var provides = app && app._context && app._context.provides;
+    var nuxt = globals && globals.$nuxt || provides && provides.$nuxt;
+    config = nuxt && nuxt.$config || globals && globals.$config || provides && provides.$config;
+    key = config && config.public && config.public.recaptchaPolicySiteKey;
+    if (typeof key === "string" && key.trim()) return key.trim();
+
+    var scripts = captchaScripts();
+    if (scripts.length) return scripts[scripts.length - 1].key;
+    throw lookupError("CAPTCHA_KEY_MISSING", "Verification isn’t ready. Reload TenFore, then open the overlay again.", "No reCAPTCHA key in TenFore’s runtime config or explicitly rendered scripts.");
+  }
+
+  var captchaByKey = new Map();
+
+  function resetCaptcha(siteKey, expectedEntry) {
+    var entry = captchaByKey.get(siteKey);
+    if (!entry || expectedEntry && expectedEntry !== entry) return;
+    captchaByKey.delete(siteKey);
+    entry.script.dataset.mcgRecaptchaFailed = "true";
+    if (entry.owned) entry.script.remove();
+  }
+
+  function ensureRecaptcha(siteKey) {
+    var cached = captchaByKey.get(siteKey);
+    if (cached) return cached.promise;
+
+    var info = captchaScripts().find(function (candidate) {
+      return candidate.key === siteKey && !candidate.script.dataset.mcgRecaptchaFailed;
+    });
+    var owned = !info;
+    var script = info ? info.script : document.createElement("script");
+    if (owned) {
+      script.src = "https://www.google.com/recaptcha/enterprise.js?render=" + encodeURIComponent(siteKey);
       script.async = true;
       script.defer = true;
       script.dataset.mcgRecaptcha = "true";
-      script.onload = resolve;
-      script.onerror = reject;
-      document.head.appendChild(script);
+      info = { script: script, key: siteKey, enterprise: true };
+    }
+
+    var entry = { script: script, owned: owned, promise: null };
+    captchaByKey.set(siteKey, entry);
+    entry.promise = new Promise(function (resolve, reject) {
+      var settled = false;
+      var waitingForReady = false;
+      var timer = window.setTimeout(function () {
+        fail(lookupError("CAPTCHA_TIMEOUT", "Verification took too long. Retry, or use TenFore directly."));
+      }, 10000);
+
+      function finish() {
+        window.clearTimeout(timer);
+        script.removeEventListener("load", loaded);
+        script.removeEventListener("error", failed);
+      }
+
+      function fail(error) {
+        if (settled) return;
+        settled = true;
+        finish();
+        resetCaptcha(siteKey, entry);
+        reject(error);
+      }
+
+      function failed() {
+        fail(lookupError("CAPTCHA_LOAD", "Verification couldn’t load. Check your connection or content blocker, then retry."));
+      }
+
+      function ready() {
+        var api = window.grecaptcha && (info.enterprise ? window.grecaptcha.enterprise : window.grecaptcha);
+        if (!api || typeof api.ready !== "function") return false;
+        if (waitingForReady) return true;
+        waitingForReady = true;
+        try {
+          api.ready(function () {
+            if (settled) return;
+            var initialized = window.grecaptcha && (info.enterprise ? window.grecaptcha.enterprise : window.grecaptcha);
+            if (!initialized || typeof initialized.execute !== "function") {
+              fail(lookupError("CAPTCHA_READY", "Verification couldn’t start. Retry, or use TenFore directly."));
+              return;
+            }
+            settled = true;
+            finish();
+            resolve(initialized);
+          });
+        } catch (error) {
+          fail(lookupError("CAPTCHA_READY", "Verification couldn’t start. Retry, or use TenFore directly.", errorDetails(error)));
+        }
+        return true;
+      }
+
+      function loaded() {
+        script.dataset.mcgRecaptchaLoaded = "true";
+        if (!ready()) fail(lookupError("CAPTCHA_READY", "Verification couldn’t start. Retry, or use TenFore directly."));
+      }
+
+      script.addEventListener("load", loaded);
+      script.addEventListener("error", failed);
+      // An exact render script can already have loaded before the overlay opened.
+      if (owned) document.head.appendChild(script);
+      else if (!ready() && (script.dataset.mcgRecaptchaLoaded || /loaded|complete/.test(script.readyState || ""))) loaded();
+    });
+    return entry.promise;
+  }
+
+  function withTimeout(promise, milliseconds, error) {
+    return new Promise(function (resolve, reject) {
+      var timer = window.setTimeout(function () { reject(error); }, milliseconds);
+      Promise.resolve(promise).then(function (value) {
+        window.clearTimeout(timer);
+        resolve(value);
+      }, function (reason) {
+        window.clearTimeout(timer);
+        reject(reason);
+      });
     });
   }
 
   async function recaptchaToken(action) {
-    await ensureRecaptcha();
-    var grecaptcha = window.grecaptcha && (window.grecaptcha.enterprise || window.grecaptcha);
-    if (!grecaptcha || !grecaptcha.execute) throw new Error("reCAPTCHA is unavailable on this page.");
-    if (grecaptcha.ready) {
-      await new Promise(function (resolve) { grecaptcha.ready(resolve); });
+    var siteKey = recaptchaSiteKey();
+    var entry;
+    try {
+      var initialization = ensureRecaptcha(siteKey);
+      entry = captchaByKey.get(siteKey);
+      var api = await initialization;
+      var token = await withTimeout(Promise.resolve().then(function () {
+        return api.execute(siteKey, { action: action });
+      }), 10000, lookupError("CAPTCHA_TIMEOUT", "Verification took too long. Retry, or use TenFore directly."));
+      if (typeof token !== "string" || !token.trim()) {
+        throw lookupError("CAPTCHA_EMPTY", "Verification didn’t complete. Retry, or use TenFore directly.");
+      }
+      return token;
+    } catch (error) {
+      if (entry) resetCaptcha(siteKey, entry);
+      if (error && error.name === "CaptchaError") throw error;
+      throw lookupError("CAPTCHA_EXECUTE", "Verification didn’t complete. Retry, or use TenFore directly.", errorDetails(error));
     }
-    return grecaptcha.execute(CONFIG.siteKey, { action: action });
   }
 
   async function api(path, options) {
@@ -1385,10 +1557,12 @@
       headers.set("X-Recaptcha-Action", action);
     }
 
+    var controller = new AbortController();
     var request = {
       method: options.method || "GET",
       headers: headers,
-      credentials: "omit"
+      credentials: "omit",
+      signal: controller.signal
     };
 
     if (options.body) {
@@ -1396,36 +1570,53 @@
       request.body = JSON.stringify(options.body);
     }
 
-    var response = await fetch(url.toString(), request);
-    var text = await response.text();
-    var body = text ? safeJSON(text) : null;
-
-    if (!response.ok) {
-      throw new Error(body && body.messageForUser ? body.messageForUser : text || response.statusText);
+    var timer = window.setTimeout(function () { controller.abort(); }, 15000);
+    try {
+      var response = await fetch(url.toString(), request);
+      var text = await response.text();
+      var body = null;
+      if (text) {
+        try {
+          body = safeJSON(text);
+        } catch (error) {
+          if (response.ok) throw error;
+        }
+      }
+      if (!response.ok || body && (body.successful === false || body.status && body.status.successful === false)) {
+        var diagnostic = "HTTP " + response.status + ": " + text;
+        var reason = body && (body.messageForUser || body.status && body.status.messageForUser) || text;
+        if (/captcha|verification/i.test(reason)) {
+          throw lookupError("CAPTCHA_REJECTED", "TenFore couldn’t verify this request. Retry, or use TenFore directly.", diagnostic);
+        }
+        throw lookupError("API_REJECTED", response.status === 429 ? "TenFore is busy. Wait a moment and retry." : "TenFore couldn’t check availability. Please retry in a moment.", diagnostic);
+      }
+      return body;
+    } catch (error) {
+      if (error && (error.name === "AvailabilityError" || error.name === "CaptchaError")) throw error;
+      if (controller.signal.aborted) throw lookupError("API_TIMEOUT", "TenFore took too long to respond. Please retry.");
+      throw lookupError("API_NETWORK", "Couldn’t reach TenFore. Check your connection and retry.", errorDetails(error));
+    } finally {
+      window.clearTimeout(timer);
     }
-
-    return body;
   }
 
   function safeJSON(text) {
     try {
       return JSON.parse(text);
     } catch (error) {
-      return { messageForUser: text };
+      throw lookupError("API_RESPONSE", "TenFore returned an unexpected response. Please retry.", text);
     }
   }
 
   async function loadCourses() {
     if (!state.live) return DEMO_COURSES.map(withCourseCoords);
     var payload = await api("GolfCourse/GetGolfCourseByVanity", { params: { vanityName: CONFIG.vanityName } });
-    if (payload.status && payload.status.successful === false) {
-      throw new Error(payload.status.messageForUser || "Course lookup failed.");
-    }
+    if (!payload || !Array.isArray(payload.companyCourses)) throw lookupError("API_RESPONSE", "TenFore couldn’t load the course list. Please retry.");
     return normalizeCourses(payload);
   }
 
-  function weatherKey(course) {
-    return courseKey(course) + ":" + state.date;
+  function weatherKey(course, date) {
+    return courseKey(course) + ":" + (date || state.date);
   }
 
   async function fetchJSONWithTimeout(url, options, timeoutMs) {
@@ -1442,16 +1633,17 @@
     }
   }
 
-  async function loadWeather(course) {
+  async function loadWeather(course, date) {
     try {
-      return await loadOpenMeteoWeather(course);
+      return await loadOpenMeteoWeather(course, date);
     } catch (error) {
       return loadWeatherGov(course);
     }
   }
 
-  async function loadOpenMeteoWeather(course) {
-    var range = selectedDateInNextSeven() ? nextSevenRange() : { start: state.date, end: state.date };
+  async function loadOpenMeteoWeather(course, date) {
+    date = date || state.date;
+    var range = selectedDateInNextSeven(date) ? nextSevenRange() : { start: date, end: date };
     var url = new URL(CONFIG.weatherRoot);
     url.searchParams.set("latitude", course.weatherLat || COURSE_COORDS.fallback.lat);
     url.searchParams.set("longitude", course.weatherLon || COURSE_COORDS.fallback.lon);
@@ -1569,15 +1761,20 @@
     return parts.year + "-" + parts.month + "-" + parts.day + "T" + parts.hour + ":00";
   }
 
-  async function ensureWeather(course) {
-    var key = weatherKey(course);
+  async function ensureWeather(course, date) {
+    date = date || state.date;
+    var key = weatherKey(course, date);
     if (state.weatherByCourseDate.has(key)) return;
-
-    try {
-      state.weatherByCourseDate.set(key, await loadWeather(course));
-    } catch (error) {
-      state.weatherByCourseDate.set(key, { hours: {}, days: {}, error: error.message || "Weather unavailable" });
-    }
+    if (state.weatherRequests.has(key)) return state.weatherRequests.get(key);
+    var pending = loadWeather(course, date).then(function (weather) {
+      if (!state.disposed) state.weatherByCourseDate.set(key, weather);
+    }, function () {
+      if (!state.disposed) state.weatherByCourseDate.set(key, { hours: {}, days: {} });
+    }).finally(function () {
+      state.weatherRequests.delete(key);
+    });
+    state.weatherRequests.set(key, pending);
+    return pending;
   }
 
   function bucketWeather(course, bucket) {
@@ -1656,11 +1853,12 @@
     };
   }
 
-  function demoTimes(course) {
+  function demoTimes(course, date) {
+    date = date || state.date;
     var times = DEMO_TIMES.filter(function (row) { return row[2] === course.vanityName; }).map(function (row, index) {
       return normalizeTime({
         id: row[2] + "-" + index,
-        dateScheduled: state.date + "T" + row[0] + ":00",
+        dateScheduled: date + "T" + row[0] + ":00",
         spots: Math.max(0, (course.maxPlayers || 4) - row[1]),
         customers: Array.from({ length: row[1] }),
         price: row[1] === 0 ? 47 : 52
@@ -1668,52 +1866,55 @@
     }).filter(function (slot) {
       return slot.timeText;
     });
-    state.debugByCourse.set(requestKey(course), makeDebug(course, "preview"));
-    state.debugByCourse.get(requestKey(course)).search.available = times.length;
+    state.debugByCourse.set(requestKey(course, date), makeDebug(course, "preview", date));
+    state.debugByCourse.get(requestKey(course, date)).search.available = times.length;
     return times;
   }
 
-  async function loadTimes(course) {
-    var debug = makeDebug(course, state.live ? "live" : "preview");
-    state.debugByCourse.set(requestKey(course), debug);
+  async function loadTimes(course, date) {
+    date = date || state.date;
+    var debug = makeDebug(course, state.live ? "live" : "preview", date);
+    state.debugByCourse.set(requestKey(course, date), debug);
 
     if (!state.live) {
       await new Promise(function (resolve) { setTimeout(resolve, 120); });
-      return demoTimes(course);
+      return demoTimes(course, date);
     }
 
     var searchError = null;
     try {
-      var searchTimes = await loadSearchTimes(course, debug);
+      var searchTimes = await loadSearchTimes(course, debug, date);
       if (searchTimes.length) {
         debug.used = "TeeTimes/Search";
         return searchTimes;
       }
     } catch (error) {
       searchError = error;
-      debug.search.error = error.message || "Search failed";
+      debug.search.error = errorDetails(error);
+      if (error.name === "CaptchaError") throw error;
     }
 
     try {
-      var v4Times = await loadV4Times(course, debug);
+      var v4Times = await loadV4Times(course, debug, date);
       debug.used = "BookingEngineV4/booking-times";
       if (v4Times.length || !searchError) return v4Times;
     } catch (error) {
-      debug.v4.error = error.message || "V4 lookup failed";
+      debug.v4.error = errorDetails(error);
+      if (error.name === "CaptchaError") throw error;
       if (!searchError) throw error;
     }
 
     throw searchError;
   }
 
-  function makeDebug(course, mode) {
+  function makeDebug(course, mode, date) {
     return {
       version: VERSION.id,
       changedAt: VERSION.changedAt,
       note: VERSION.note,
       mode: mode,
       used: "",
-      date: state.date,
+      date: date || state.date,
       courseLabel: course.label,
       courseKey: courseKey(course),
       courseId: course.id,
@@ -1726,20 +1927,22 @@
     };
   }
 
-  async function loadSearchTimes(course, debug) {
+  async function loadSearchTimes(course, debug, date) {
+    date = date || state.date;
     var payload = await api("TeeTimes/Search", {
       recaptcha: true,
       action: "teetimes_search",
       params: {
         golfCourseIds: course.id,
-        dateFrom: state.date,
-        dateTo: state.date + "T23:59:59",
+        dateFrom: date,
+        dateTo: date + "T23:59:59",
         players: 1,
         holes: course.defaultHoles || 18
       }
     });
 
-    var data = Array.isArray(payload && payload.data) ? payload.data : Array.isArray(payload) ? payload : [];
+    var data = Array.isArray(payload && payload.data) ? payload.data : Array.isArray(payload) ? payload : null;
+    if (!data) throw lookupError("API_RESPONSE", "TenFore returned an unexpected response. Please retry.", JSON.stringify(payload));
     var matched = data.filter(function (raw) { return matchesCourseVariant(raw, course); });
     var available = matched.map(function (raw) { return normalizeTime(raw, course); }).filter(function (slot) { return slot.timeText; });
 
@@ -1776,23 +1979,21 @@
     return true;
   }
 
-  async function loadV4Times(course, debug) {
+  async function loadV4Times(course, debug, date) {
+    date = date || state.date;
     var payload = await api("BookingEngineV4/booking-times", {
       method: "POST",
       recaptcha: true,
       body: {
         golfCourseId: course.id,
         subCourseId: course.subCourseId || null,
-        dateFrom: state.date,
+        dateFrom: date,
         appId: CONFIG.appId
       }
     });
 
-    if (payload.successful === false || payload.status && payload.status.successful === false) {
-      throw new Error(payload.messageForUser || payload.status && payload.status.messageForUser || "Tee-time lookup failed.");
-    }
-
-    var data = Array.isArray(payload.data) ? payload.data : Array.isArray(payload) ? payload : [];
+    var data = Array.isArray(payload && payload.data) ? payload.data : Array.isArray(payload) ? payload : null;
+    if (!data) throw lookupError("API_RESPONSE", "TenFore returned an unexpected response. Please retry.", JSON.stringify(payload));
     var matched = data.filter(function (raw) { return matchesCourseVariant(raw, course); });
     var available = matched.map(function (raw) { return normalizeTime(raw, course); }).filter(function (slot) { return slot.timeText; });
 
@@ -1872,6 +2073,17 @@
     return course ? state.timesByCourse.get(requestKey(course)) || [] : [];
   }
 
+  function selectedAvailabilityError(course) {
+    return state.coursesError || (course ? state.errorsByCourse.get(requestKey(course)) : null);
+  }
+
+  function syncSelectedState() {
+    var course = selectedCourse();
+    state.loading = state.coursesLoading || !!(course && state.requestsByCourse.has(requestKey(course)));
+    var error = selectedAvailabilityError(course);
+    state.error = error ? availabilityMessage(error) : "";
+  }
+
   function summary(times) {
     var openSlots = times.length;
     var zeroBooked = times.filter(function (slot) { return slot.booked === 0; }).length;
@@ -1881,6 +2093,8 @@
   }
 
   function render() {
+    if (state.disposed || !state.shadow) return;
+    syncSelectedState();
     var course = selectedCourse();
     var times = sortedTimes(selectedTimes());
 
@@ -1991,9 +2205,9 @@
   function renderStatus() {
     var content = "";
     if (state.loading) {
-      content = '<span class="mcg-spinner"></span><span>Loading tee times...</span>';
+      content = '<span class="mcg-spinner"></span><span>' + (state.coursesLoading ? "Loading MCG courses…" : "Checking tee times…") + '</span>';
     } else if (state.error) {
-      content = '<span>' + escapeHTML(state.error) + "</span>";
+      content = '<span>Availability check failed. Retry below or use TenFore.</span>';
     } else if (!state.live) {
       content = "<span>Preview mode. Live calls run from fox.tenfore.golf because TenFore requires a reCAPTCHA token for that domain.</span>";
     }
@@ -2023,9 +2237,17 @@
       '<div class="mcg-section-head"><div>',
       '<div class="mcg-section-title">', escapeHTML(title), "</div>",
       "</div></div>",
+      renderBookingStatus(),
       '<div class="mcg-times">', content, "</div>",
       "</section>"
     ].join("");
+  }
+
+  function renderBookingStatus() {
+    if (!state.bookingError) return "";
+    return '<div class="mcg-status show" role="alert">' +
+      escapeHTML(state.bookingError) +
+      ' Try Book again, or <a class="mcg-link" href="' + escapeHTML(state.bookingFallbackUrl) + '">open this tee time in TenFore</a>.</div>';
   }
 
   function renderTimeTable(course, times) {
@@ -2040,26 +2262,48 @@
   }
 
   function renderEmpty(course) {
+    var error = selectedAvailabilityError(course);
+    var loaded = course && state.timesByCourse.has(requestKey(course));
     var debug = course ? state.debugByCourse.get(requestKey(course)) : null;
+    var title;
+    var message;
+    var actions = "";
+    if (state.loading || !loaded && !error) {
+      title = state.coursesLoading ? "Loading MCG courses…" : "Checking tee times…";
+      message = course ? "Loading availability for " + course.label + " on " + state.date + "." : "Loading the course list from TenFore.";
+    } else if (error) {
+      title = "Couldn’t check tee times";
+      message = availabilityMessage(error);
+      actions = '<div class="mcg-recovery-actions"><button class="mcg-button" data-action="retry">Retry</button>' + (state.live ? '<button class="mcg-button secondary" data-action="close">Use TenFore</button>' : "") + '</div>';
+    } else {
+      title = "No tee times available";
+      message = "TenFore returned no tee times for " + course.label + " on " + state.date + ". Try another date.";
+    }
     var details = "";
 
-    if (debug) {
+    if (debug || error) {
       details = [
-        '<div class="mcg-debug">',
+        '<details class="mcg-debug"><summary>Technical details</summary>',
+        debug ? [
         escapeHTML(debug.version), " · ", escapeHTML(debug.changedAt), "<br>",
         "Search raw ", escapeHTML(debugText(debug.search.raw)), " / matched ", escapeHTML(debugText(debug.search.matched)), " / available ", escapeHTML(debugText(debug.search.available)),
         debug.search.error ? "<br>Search error: " + escapeHTML(debug.search.error) : "",
         "<br>V4 raw ", escapeHTML(debugText(debug.v4.raw)), " / matched ", escapeHTML(debugText(debug.v4.matched)), " / available ", escapeHTML(debugText(debug.v4.available)),
         debug.v4.error ? "<br>V4 error: " + escapeHTML(debug.v4.error) : "",
         "<br>Course ", escapeHTML(debug.courseId), debug.subCourseId ? " / subcourse " + escapeHTML(debug.subCourseId) : "", " / ", escapeHTML(debug.holes), " holes / ", escapeHTML(debug.players), " players",
+        "<br>Date ", escapeHTML(debug.date),
         debug.sample ? "<br>Sample " + escapeHTML(debug.sample) : "",
-        "</div>"
+        ].join("") : "",
+        error ? "<br>" + escapeHTML(error.code || "LOOKUP_FAILED") + ": " + escapeHTML(errorDetails(error)) : "",
+        "</details>"
       ].join("");
     }
 
     return [
       '<div class="mcg-empty"><div class="mcg-empty-inner">',
-      '<div class="mcg-empty-title">TenFore returned no tee times for this course and date.</div>',
+      '<div class="mcg-empty-title">', escapeHTML(title), '</div>',
+      '<div>', escapeHTML(message), '</div>',
+      actions,
       details,
       "</div></div>"
     ].join("");
@@ -2068,6 +2312,7 @@
   function renderTimeRow(slot, course) {
     var canBook = slot.available >= state.players;
     var bookUrl = canBook ? bookingUrl(slot) : "";
+    var nativeUrl = state.live ? bookingCourseUrl(slot) : "https://" + CONFIG.host + "/" + encodeURIComponent(slot.vanityName || CONFIG.vanityName);
     var unbookableLabel = slot.available <= 0 ? "Full" : slot.available + " left";
     var weather = bucketWeather(course, { start: slotMinutes(slot) });
     var price = formatPrice(slot.price) || "-";
@@ -2080,7 +2325,7 @@
       '<td><span class="mcg-price">', escapeHTML(price), "</span></td>",
       '<td><span class="mcg-table-weather" title="', escapeHTML(weather.title || "hourly weather"), '">', escapeHTML(weather.label || "-"), "</span></td>",
       '<td class="mcg-table-action">',
-      bookUrl ? '<a class="mcg-link" href="' + escapeHTML(bookUrl) + '" data-book-slot="' + escapeHTML(slot.id) + '">Book</a>' : '<span class="mcg-micro" title="' + escapeHTML("Only " + slot.available + " open") + '">' + escapeHTML(unbookableLabel) + "</span>",
+      bookUrl ? '<a class="mcg-link" href="' + escapeHTML(nativeUrl) + '" data-book-slot="' + escapeHTML(slot.id) + '"' + (state.bookingSlotId ? ' aria-disabled="true"' : '') + '>' + (String(state.bookingSlotId) === String(slot.id) ? 'Opening…' : 'Book') + '</a>' : '<span class="mcg-micro" title="' + escapeHTML("Only " + slot.available + " open") + '">' + escapeHTML(unbookableLabel) + "</span>",
       "</td></tr>"
     ].join("");
   }
@@ -2115,17 +2360,26 @@
     return "low";
   }
 
-  function bookingUrl(slot) {
+  function bookingUrl(slot, players) {
     if (!slot.teeTimeId) return "";
 
     var url = new URL("/tee-time/" + encodeURIComponent(slot.teeTimeId), "https://" + CONFIG.host);
-    url.searchParams.set("players", String(state.players));
+    url.searchParams.set("players", String(players || state.players));
+    url.searchParams.set("holes", String(slot.holes));
+    if (slot.back9) url.searchParams.set("back9", "true");
     url.searchParams.set("backToSearch", "true");
     return url.toString();
   }
 
-  function bookingPath(slot) {
-    var url = new URL(bookingUrl(slot));
+  function bookingCourseUrl(slot, players) {
+    if (!slot.teeTimeId) return "";
+    var url = new URL(bookingUrl(slot, players));
+    url.pathname = "/" + encodeURIComponent(slot.vanityName || CONFIG.vanityName) + url.pathname;
+    return url.toString();
+  }
+
+  function bookingPath(slot, players) {
+    var url = new URL(bookingUrl(slot, players));
     return url.pathname + url.search;
   }
 
@@ -2139,7 +2393,7 @@
 
     var payload = await api("GolfCourse/GetGolfCourseByVanity", { params: { vanityName: vanity } });
     var course = payload && payload.data && (payload.data.golfCourseID || payload.data.id) ? payload.data : payload;
-    if (!course || !(course.golfCourseID || course.id)) throw new Error("Could not load booking course.");
+    if (!course || Number(course.golfCourseID || course.id) !== Number(slot.courseId)) throw new Error("Could not load the selected booking course.");
 
     state.bookingCourseByVanity.set(vanity, course);
     return course;
@@ -2171,7 +2425,7 @@
   }
 
   function tenForeRouter(app) {
-    var globalProperties = app && app._context && app._context.config && app._context.config.globalProperties;
+    var globalProperties = app && app.config && app.config.globalProperties;
     if (globalProperties && globalProperties.$router && typeof globalProperties.$router.push === "function") return globalProperties.$router;
 
     var provides = app && app._context && app._context.provides;
@@ -2193,47 +2447,68 @@
     if (!store || typeof store.setGolfCourse !== "function") return { app: app, primed: false };
 
     var course = await loadBookingCourse(slot);
+    if (state.disposed) throw new Error("Overlay closed.");
     store.setGolfCourse(course);
 
-    if (slot.subCourseId && typeof store.setSubCourseId === "function") {
-      store.setSubCourseId(slot.subCourseId);
+    if (typeof store.setSubCourseId === "function") {
+      store.setSubCourseId(slot.subCourseId || 0);
     }
+
+    // Allow TenFore's persisted store and reactive updates to settle before routing.
+    var globals = app.config && app.config.globalProperties;
+    if (globals && typeof globals.$nextTick === "function") await globals.$nextTick();
 
     return { app: app, primed: true };
   }
 
   async function bookSlot(slotId) {
     var slot = selectedSlot(slotId);
-    if (!slot || slot.available < state.players) return;
+    if (!slot || !slot.teeTimeId || slot.available < state.players || state.bookingSlotId) return;
 
-    var url = bookingUrl(slot);
-    var path = bookingPath(slot);
+    var players = state.players;
+    var url = bookingUrl(slot, players);
+    var path = bookingPath(slot, players);
+    state.bookingSlotId = String(slot.id);
+    state.bookingError = "";
+    state.bookingFallbackUrl = bookingCourseUrl(slot, players);
+    render();
 
-    if (state.live) {
-      try {
+    try {
+      if (state.live) {
         var context = await primeTenForeCourse(slot);
+        if (state.disposed) return;
         var router = tenForeRouter(context.app || tenForeApp());
-        if (router) {
-          window.__mcgTeePressureCleanup();
-          await router.push(path);
-          return;
+        if (!context.primed || !router) {
+          throw new Error("TenFore’s booking page isn’t ready.");
         }
-      } catch (error) {
-        console.warn("MCG pressure booking handoff failed; using direct URL.", error);
+        await withTimeout(router.push(path), 10000, new Error("Opening the booking page took too long."));
+        var route = router.currentRoute && router.currentRoute.value;
+        if (!route || route.path !== new URL(url).pathname ||
+            String(route.query.players) !== String(players) || String(route.query.holes) !== String(slot.holes) ||
+            (slot.back9 && route.query.back9 === undefined)) {
+          throw new Error("TenFore couldn’t open the selected tee time.");
+        }
+      } else {
+        // Preview rows are examples, so their synthetic IDs cannot be booked.
+        window.location.assign("https://" + CONFIG.host + "/" + encodeURIComponent(slot.vanityName || CONFIG.vanityName));
       }
+      window.__mcgTeePressureCleanup();
+    } catch (error) {
+      if (!state.disposed) {
+        state.bookingError = "Couldn’t open booking. Please retry in a moment.";
+        console.warn("MCG pressure booking handoff failed.", error);
+      }
+    } finally {
+      state.bookingSlotId = "";
+      render();
     }
-
-    window.__mcgTeePressureCleanup();
-    window.location.assign(url);
   }
 
   async function setSelectedDate(value) {
+    state.bookingError = "";
     state.date = isISODate(value) ? value : todayISO();
     state.draftDate = state.date;
     state.showCustomDate = false;
-    state.timesByCourse.clear();
-    state.debugByCourse.clear();
-    state.weatherByCourseDate.clear();
     await ensureSelectedTimes();
   }
 
@@ -2284,6 +2559,7 @@
 
     state.shadow.querySelectorAll("[data-book-slot]").forEach(function (link) {
       link.addEventListener("click", async function (event) {
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
         event.preventDefault();
         await bookSlot(link.dataset.bookSlot);
       });
@@ -2291,6 +2567,7 @@
 
     state.shadow.querySelectorAll("[data-course]").forEach(function (button) {
       button.addEventListener("click", async function () {
+        state.bookingError = "";
         state.selectedKey = button.dataset.course;
         await ensureSelectedTimes();
       });
@@ -2330,51 +2607,64 @@
       });
     }
 
-    var refresh = state.shadow.querySelector('[data-action="refresh"]');
-    if (refresh) {
-      refresh.addEventListener("click", async function () {
-        var course = selectedCourse();
-        if (course) state.timesByCourse.delete(requestKey(course));
-        if (course) state.debugByCourse.delete(requestKey(course));
-        if (course) state.weatherByCourseDate.delete(weatherKey(course));
-        await ensureSelectedTimes();
-      });
-    }
+    state.shadow.querySelectorAll('[data-action="refresh"], [data-action="retry"]').forEach(function (button) {
+      button.addEventListener("click", retrySelectedTimes);
+    });
 
-    var close = state.shadow.querySelector('[data-action="close"]');
-    if (close) close.addEventListener("click", window.__mcgTeePressureCleanup);
+    state.shadow.querySelectorAll('[data-action="close"]').forEach(function (button) {
+      button.addEventListener("click", window.__mcgTeePressureCleanup);
+    });
   }
 
   async function ensureSelectedTimes() {
+    if (state.disposed) return;
     var course = selectedCourse();
-    if (!course) return render();
-    var key = requestKey(course);
+    if (!course || state.coursesError) return render();
+    var date = state.date;
+    var key = requestKey(course, date);
+    ensureWeather(course, date).then(function () {
+      if (!state.disposed && selectedCourse() && requestKey(selectedCourse()) === key) render();
+    });
+
     if (state.timesByCourse.has(key)) {
+      state.errorsByCourse.delete(key);
       render();
-      if (!state.weatherByCourseDate.has(weatherKey(course))) {
-        ensureWeather(course).then(function () {
-          render();
-        });
-      }
       return;
     }
 
-    state.loading = true;
-    state.error = "";
-    render();
-
-    try {
-      var weather = ensureWeather(course);
-      state.timesByCourse.set(key, await loadTimes(course));
-      state.loading = false;
-      render();
-      await weather;
-    } catch (error) {
-      state.error = error.message || "Could not load tee times.";
-    } finally {
-      state.loading = false;
-      render();
+    var pending = state.requestsByCourse.get(key);
+    if (!pending) {
+      state.errorsByCourse.delete(key);
+      pending = (async function () {
+        try {
+          var times = await loadTimes(course, date);
+          if (!state.disposed) state.timesByCourse.set(key, times);
+        } catch (error) {
+          if (!state.disposed) state.errorsByCourse.set(key, error);
+        } finally {
+          state.requestsByCourse.delete(key);
+          if (!state.disposed && selectedCourse() && requestKey(selectedCourse()) === key) render();
+        }
+      })();
+      state.requestsByCourse.set(key, pending);
     }
+    render();
+    await pending;
+  }
+
+  async function retrySelectedTimes() {
+    if (state.disposed) return;
+    if (state.coursesError || !state.courses.length) await ensureCourses();
+    if (state.disposed || state.coursesError) return;
+    var course = selectedCourse();
+    if (course) {
+      var key = requestKey(course);
+      state.timesByCourse.delete(key);
+      state.debugByCourse.delete(key);
+      state.errorsByCourse.delete(key);
+      state.weatherByCourseDate.delete(weatherKey(course));
+    }
+    await ensureSelectedTimes();
   }
 
   async function applyDraftDate() {
@@ -2384,24 +2674,37 @@
     await setSelectedDate(value);
   }
 
+  async function ensureCourses() {
+    if (state.coursesRequest) return state.coursesRequest;
+    state.coursesLoading = true;
+    state.coursesError = null;
+    state.coursesRequest = (async function () {
+      try {
+        var courses = await loadCourses();
+        if (!courses.length) throw lookupError("COURSES_EMPTY", "TenFore returned no MCG courses. Please retry, or use TenFore directly.");
+        if (state.disposed) return;
+        state.courses = courses;
+        if (!courses.some(function (course) { return courseKey(course) === state.selectedKey; })) {
+          var northwestInside = courses.find(function (course) { return /northwest/i.test(course.fullName) && /inside 9/i.test(course.subCourseName || course.label); });
+          state.selectedKey = courseKey(northwestInside || courses[0]);
+        }
+      } catch (error) {
+        if (!state.disposed) state.coursesError = error;
+      } finally {
+        state.coursesLoading = false;
+        state.coursesRequest = null;
+        render();
+      }
+    })();
+    render();
+    return state.coursesRequest;
+  }
+
   async function boot() {
     mount();
-    state.loading = true;
-    render();
-
-    try {
-      state.courses = await loadCourses();
-      if (!state.courses.length) throw new Error("No MCG courses were returned.");
-      var northwestInside = state.courses.find(function (course) { return /northwest/i.test(course.fullName) && /inside 9/i.test(course.subCourseName || course.label); });
-      state.selectedKey = courseKey(northwestInside || state.courses[0]);
-    } catch (error) {
-      state.error = error.message || "Could not load courses.";
-      state.courses = DEMO_COURSES;
-      state.selectedKey = courseKey(state.courses[0]);
-    } finally {
-      state.loading = false;
-      await ensureSelectedTimes();
-    }
+    await ensureCourses();
+    if (!state.disposed && !state.coursesError) await ensureSelectedTimes();
+    state.booted = true;
   }
 
   function mount() {
