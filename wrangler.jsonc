@@ -3,6 +3,7 @@
   "main": "worker.mjs",
   "compatibility_date": "2026-10-19",
   "workers_dev": true,
+  "routes": [ { "pattern": "mcgtee.com", "custom_domain": true }, { "pattern": "www.mcgtee.com", "custom_domain": true } ],
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",

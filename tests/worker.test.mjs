@@ -59,10 +59,10 @@ test('uses only the legacy GET with next-day end and preserves remaining capacit
   assert.doesNotMatch(JSON.stringify(body), /secret|customer|notes/);
 });
 
-test('main courses use subcourse zero and month rollover sends the next day', async () => {
+test('main courses omit the subcourse (TenFore returns nothing for zero) and month rollover sends the next day', async () => {
   const h = harness(async url => {
     const params = new URL(url).searchParams;
-    assert.equal(params.get('subCourseID'), '0');
+    assert.equal(params.has('subCourseID'), false);
     assert.equal(params.get('endDate'), '2026-11-01');
     return response(times([]));
   }, { now: () => Date.parse('2026-10-31T12:00:00Z') });
@@ -213,4 +213,107 @@ test('routes have read-only methods, safe health and static asset passthrough', 
   const asset = await h.fetch(new Request('https://example.test/app.js'), { ASSETS: { fetch: async req => new Response(new URL(req.url).pathname) } });
   assert.equal(await asset.text(), '/app.js');
   assert.equal(h.calls.length, 0);
+});
+
+const dayRequest = (query = 'date=2026-10-20') => new Request(`https://example.test/api/day?${query}`);
+const unitOf = url => { const p = new URL(url).searchParams; return `${p.get('golfCourseID')}/${p.get('subCourseID') || 0}`; };
+
+test('day returns all eleven units with bounded concurrency and per-unit failures', async () => {
+  let active = 0, peak = 0;
+  const h = harness(async url => {
+    active++; peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 2));
+    active--;
+    if (unitOf(url) === '16511/0') throw new Error('private upstream detail');
+    if (unitOf(url) === '16507/0') return response(times([row({ maxSlots: 0, notes: 'private' })]));
+    return response(times([row({ teeTimeID: Number(new URL(url).searchParams.get('golfCourseID')), notes: 'secret' })]));
+  });
+  const res = await h.fetch(dayRequest());
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.date, '2026-10-20');
+  assert.equal(body.units.length, 11);
+  assert.equal(h.calls.length, 11);
+  assert.ok(peak <= 4, `peak concurrency ${peak}`);
+  assert.deepEqual(body.units.map(u => `${u.courseId}/${u.subCourseId}`), ['16503/0', '16504/0', '16504/1032', '16506/0', '16507/0', '16508/0', '16509/0', '16509/1031', '16510/0', '16511/0', '16512/0']);
+  const failed = body.units.filter(u => !u.ok);
+  assert.deepEqual(failed.map(u => [u.courseId, u.code]), [[16507, 'UPSTREAM_RESPONSE'], [16511, 'UPSTREAM_UNAVAILABLE']]);
+  assert.ok(failed.every(u => u.messageForUser && !u.teeTimes));
+  const ok = body.units.find(u => u.courseId === 16504 && u.subCourseId === 1032);
+  assert.deepEqual(ok.teeTimes, [{ teeTimeID: 16504, dateScheduled: '2026-10-20T08:00:00.000-04:00', availableSlots: 2, maxSlots: 4, maxPlayers: 4, priceBeforeTax: 29 }]);
+  assert.equal(ok.meta.stale, false);
+  assert.ok(body.meta.fetchedAt);
+  assert.doesNotMatch(JSON.stringify(body), /secret|private|captcha/);
+});
+
+test('day shares the per-unit availability cache with the single-unit route', async () => {
+  const h = harness();
+  await h.fetch();
+  const body = await (await h.fetch(dayRequest())).json();
+  assert.equal(h.calls.length, 11, 'Inside 9 came from the cache');
+  assert.equal(body.units.every(u => u.ok), true);
+  await h.fetch(dayRequest());
+  assert.equal(h.calls.length, 11);
+  h.advance(60_000);
+  await h.fetch(dayRequest());
+  assert.equal(h.calls.length, 22);
+});
+
+test('day validates its date and parameters before fetching', async () => {
+  const h = harness();
+  for (const query of ['', 'date=2026-10-19', 'date=2026-10-28', 'date=2026-02-30', 'date=2026-10-20&date=2026-10-21', 'date=2026-10-20&courseId=16504']) {
+    assert.equal((await h.fetch(dayRequest(query))).status, 400, query);
+  }
+  assert.equal((await h.fetch(dayRequest('date=2026-10-27'))).status, 200);
+  assert.equal(h.calls.length, 11);
+});
+
+const meteo = (extra = {}) => ({
+  latitude: 39.15, generationtime_ms: 1, timezone: 'America/New_York',
+  daily: { time: ['2026-10-20', '2026-10-21'], sunrise: ['2026-10-20T07:23', '2026-10-21T07:24'], sunset: ['2026-10-20T18:22', '2026-10-21T18:21'], temperature_2m_max: [68.14, 63], temperature_2m_min: [46.6, 44], precipitation_probability_max: [10, 55], wind_speed_10m_max: [9.4, 17.6] },
+  hourly: { time: ['2026-10-20T07:00', '2026-10-20T08:00', '2026-10-21T07:00'], temperature_2m: [47.4, 49.6, 44], precipitation_probability: [0, 5, null], wind_speed_10m: [3.2, 4.8, 12], weather_code: [0, 1, 61] },
+  ...extra
+});
+
+test('weather reads Open-Meteo once for the county, sanitizes and caches for 30 minutes', async () => {
+  const h = harness(async url => {
+    const upstream = new URL(url);
+    assert.equal(upstream.origin, 'https://api.open-meteo.com');
+    assert.equal(upstream.searchParams.get('latitude'), '39.154');
+    assert.equal(upstream.searchParams.get('timezone'), 'America/New_York');
+    assert.equal(upstream.searchParams.get('forecast_days'), '9');
+    return response(meteo());
+  });
+  const req = () => new Request('https://example.test/api/weather');
+  const body = await (await h.fetch(req())).json();
+  assert.deepEqual(body.days['2026-10-20'], { sunrise: '07:23', sunset: '18:22', high: 68, low: 47, rainMax: 10, windMax: 9 });
+  assert.deepEqual(body.days['2026-10-21'].windMax, 18);
+  assert.deepEqual(body.hours['2026-10-20'], [{ hour: 7, temp: 47, rain: 0, wind: 3, code: 0 }, { hour: 8, temp: 50, rain: 5, wind: 5, code: 1 }]);
+  assert.deepEqual(body.hours['2026-10-21'], [{ hour: 7, temp: 44, rain: null, wind: 12, code: 61 }]);
+  assert.deepEqual(Object.keys(body).sort(), ['days', 'hours', 'meta']);
+  h.advance(30 * 60_000 - 1);
+  await h.fetch(req());
+  assert.equal(h.calls.length, 1);
+  assert.equal((await h.fetch(new Request('https://example.test/api/weather?lat=1'))).status, 400);
+});
+
+test('weather upstream failures and bad payloads are safe 502s, with bounded stale fallback', async () => {
+  for (const body of [{}, '<html>private</html>', meteo({ daily: { time: ['bad'] } }), meteo({ hourly: { time: ['2026-10-20T25:00'] } })]) {
+    const h = harness(async () => response(body));
+    const res = await h.fetch(new Request('https://example.test/api/weather'));
+    assert.equal(res.status, 502);
+    assert.doesNotMatch(await res.text(), /private|html/);
+  }
+  const down = harness(async () => response('private', 500));
+  const res = await down.fetch(new Request('https://example.test/api/weather'));
+  assert.equal(res.status, 502);
+  assert.match((await res.json()).messageForUser, /Weather/);
+  let fail = false;
+  const h = harness(async () => { if (fail) throw new Error('down'); return response(meteo()); });
+  await h.fetch(new Request('https://example.test/api/weather'));
+  h.advance(30 * 60_000);
+  fail = true;
+  assert.equal((await (await h.fetch(new Request('https://example.test/api/weather'))).json()).meta.stale, true);
+  h.advance(6 * 3600_000);
+  assert.equal((await h.fetch(new Request('https://example.test/api/weather'))).status, 502);
 });

@@ -5,25 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MCG Tee — Montgomery County Tee Times</title>
   <meta name="description" content="An independent tee-time finder for Montgomery County golf courses. Compare available player spots, times, and weather, then book with MCG Golf / TenFore.">
-  <meta name="theme-color" content="#214236">
+  <meta name="theme-color" content="#f7f5ef" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#121815" media="(prefers-color-scheme: dark)">
+  <meta name="color-scheme" content="light dark">
   <meta property="og:title" content="MCG Tee">
   <meta property="og:description" content="Find tee times at Montgomery County golf courses. Bookings handled by MCG Golf / TenFore.">
   <meta property="og:type" content="website">
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-  <style>
-    html { background:#f5f7f2; color:#17201b; font-family:system-ui,-apple-system,sans-serif; }
-    body { margin:0; }
-    #mcg-preview-root { display:block; min-height:60vh; }
-    footer { max-width:1220px; padding:0 18px 24px; margin:auto; font-size:13px; color:#526157; line-height:1.6; }
-    footer a { color:#214236; }
-    noscript p { max-width:700px; margin:40px auto; padding:20px; }
-  </style>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="modulepreload" href="/lib.mjs">
 </head>
 <body>
-  <div id="mcg-preview-root" aria-label="MCG Tee tee-time finder"></div>
-  <noscript><p>MCG Tee needs JavaScript to check tee times. You can also <a href="https://fox.tenfore.golf/mcggolf">find and book tee times directly with MCG Golf / TenFore</a>.</p></noscript>
-  <footer>Independent tee-time finder. Bookings handled by <a href="https://fox.tenfore.golf/mcggolf" target="_blank" rel="noopener">MCG Golf / TenFore</a>.</footer>
-  <script>window.__MCG_HOSTED_APP__ = {apiRoot:'/api'};</script>
-  <script src="/app.js"></script>
+  <div id="app" aria-label="MCG Tee tee-time finder"></div>
+  <noscript><p class="noscript">MCG Tee needs JavaScript to check tee times. You can also <a href="https://fox.tenfore.golf/mcggolf">find and book tee times directly with MCG Golf / TenFore</a>.</p></noscript>
+  <script type="module" src="/main.mjs"></script>
 </body>
 </html>

@@ -5,6 +5,11 @@ const ZONE = 'America/New_York';
 const MAX_ENTRIES = 128;
 const AVAILABILITY = { fresh: 60_000, maxAge: 300_000 };
 const METADATA = { fresh: 6 * 3600_000, maxAge: 24 * 3600_000 };
+const WEATHER = { fresh: 30 * 60_000, maxAge: 6 * 3600_000 };
+const DAY_CONCURRENCY = 4;
+// Every bookable unit: each main course, plus the two approved subcourses.
+const UNITS = [...COURSES].sort((a, b) => a - b).flatMap(id => [[id, 0], ...(SUBCOURSES.has(id) ? [[id, SUBCOURSES.get(id)]] : [])]);
+const WEATHER_URL = 'https://api.open-meteo.com/v1/forecast?latitude=39.154&longitude=-77.125&hourly=temperature_2m,precipitation_probability,wind_speed_10m,weather_code&daily=sunrise,sunset,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=America%2FNew_York&forecast_days=9';
 const dateFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: ZONE, year: 'numeric', month: '2-digit', day: '2-digit' });
 
 function calendarDate(value) {
@@ -54,19 +59,23 @@ function integer(value) {
   return Number.isSafeInteger(number) ? number : null;
 }
 
-function availabilityQuery(url, now) {
-  parameters(url, ['courseId', 'subCourseId', 'date']);
-  const courseId = integer(url.searchParams.get('courseId'));
-  const subCourseId = url.searchParams.has('subCourseId') ? integer(url.searchParams.get('subCourseId')) : 0;
+function bookableDate(url, now) {
   const date = url.searchParams.get('date') || '';
-  if (!COURSES.has(courseId) || subCourseId === null || (subCourseId !== 0 && SUBCOURSES.get(courseId) !== subCourseId)) {
-    throw new SafeError(400, 'INVALID_COURSE', 'Choose a supported MCG course and subcourse.');
-  }
   const today = calendarDate(now);
   if (!validDate(date) || date < today || date > nextDate(today, 7)) {
     throw new SafeError(400, 'INVALID_DATE', 'Choose a valid date from today through seven days ahead (Eastern time).');
   }
-  return { courseId, subCourseId, date };
+  return date;
+}
+
+function availabilityQuery(url, now) {
+  parameters(url, ['courseId', 'subCourseId', 'date']);
+  const courseId = integer(url.searchParams.get('courseId'));
+  const subCourseId = url.searchParams.has('subCourseId') ? integer(url.searchParams.get('subCourseId')) : 0;
+  if (!COURSES.has(courseId) || subCourseId === null || (subCourseId !== 0 && SUBCOURSES.get(courseId) !== subCourseId)) {
+    throw new SafeError(400, 'INVALID_COURSE', 'Choose a supported MCG course and subcourse.');
+  }
+  return { courseId, subCourseId, date: bookableDate(url, now) };
 }
 
 function safeText(value, limit = 160) {
@@ -144,6 +153,48 @@ function sanitizeTimes(body, date) {
   return { teeTimes, status: { successful: true } };
 }
 
+function rounded(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : null;
+}
+
+function sanitizeWeather(body) {
+  const daily = body?.daily, hourly = body?.hourly;
+  if (!daily || !hourly || !Array.isArray(daily.time) || !Array.isArray(hourly.time)) throw schemaError();
+  const column = (source, key) => Array.isArray(source[key]) && source[key].length === source.time.length ? source[key] : Array(source.time.length).fill(null);
+  const clock = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value) ? value.slice(11, 16) : null;
+  const days = {}, hours = {};
+  daily.time.slice(0, 16).forEach((date, i) => {
+    if (!validDate(date)) throw schemaError();
+    days[date] = {
+      sunrise: clock(column(daily, 'sunrise')[i]), sunset: clock(column(daily, 'sunset')[i]),
+      high: rounded(column(daily, 'temperature_2m_max')[i]), low: rounded(column(daily, 'temperature_2m_min')[i]),
+      rainMax: rounded(column(daily, 'precipitation_probability_max')[i]), windMax: rounded(column(daily, 'wind_speed_10m_max')[i])
+    };
+  });
+  hourly.time.slice(0, 16 * 24).forEach((time, i) => {
+    const match = typeof time === 'string' && time.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}):00$/);
+    if (!match || !validDate(match[1]) || Number(match[2]) > 23) throw schemaError();
+    (hours[match[1]] ||= []).push({
+      hour: Number(match[2]), temp: rounded(column(hourly, 'temperature_2m')[i]), rain: rounded(column(hourly, 'precipitation_probability')[i]),
+      wind: rounded(column(hourly, 'wind_speed_10m')[i]), code: rounded(column(hourly, 'weather_code')[i])
+    });
+  });
+  if (!Object.keys(days).length) throw schemaError();
+  return { days, hours };
+}
+
+async function settleAll(items, limit, task) {
+  const results = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      try { results[index] = { status: 'fulfilled', value: await task(items[index]) }; } catch (reason) { results[index] = { status: 'rejected', reason }; }
+    }
+  }));
+  return results;
+}
+
 export function createWorker(dependencies = {}) {
   const fetchImpl = dependencies.fetchImpl || globalThis.fetch.bind(globalThis);
   const now = dependencies.now || Date.now;
@@ -159,27 +210,31 @@ export function createWorker(dependencies = {}) {
     while (memory.size > MAX_ENTRIES) memory.delete(memory.keys().next().value);
   }
 
-  async function upstream(path, params) {
+  function upstream(path, params) {
     const url = new URL(path, UPSTREAM);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+    return getJson(url.toString(), 'TenFore');
+  }
+
+  async function getJson(url, service) {
     const controller = new AbortController();
     let timer;
     try {
       return await Promise.race([
         (async () => {
           // Workers has no browser cookie jar. Reject redirects through the status check below.
-          const response = await fetchImpl(url.toString(), { headers: { Accept: 'application/json' }, signal: controller.signal, redirect: 'manual' });
-          if (!response.ok) throw new SafeError(response.status === 429 ? 503 : 502, 'UPSTREAM_UNAVAILABLE', 'TenFore is temporarily unavailable. Please retry shortly.');
+          const response = await fetchImpl(url, { headers: { Accept: 'application/json' }, signal: controller.signal, redirect: 'manual' });
+          if (!response.ok) throw new SafeError(response.status === 429 ? 503 : 502, 'UPSTREAM_UNAVAILABLE', `${service} is temporarily unavailable. Please retry shortly.`);
           return await response.json();
         })(),
         new Promise((_, reject) => { timer = setTimeout(() => {
-          reject(new SafeError(503, 'UPSTREAM_TIMEOUT', 'TenFore took too long to respond. Please retry.'));
+          reject(new SafeError(503, 'UPSTREAM_TIMEOUT', `${service} took too long to respond. Please retry.`));
           controller.abort();
         }, timeoutMs); })
       ]);
     } catch (error) {
       if (error instanceof SafeError) throw error;
-      throw new SafeError(502, 'UPSTREAM_UNAVAILABLE', 'Couldn’t check TenFore. Please retry shortly.');
+      throw new SafeError(502, 'UPSTREAM_UNAVAILABLE', `Couldn’t check ${service}. Please retry shortly.`);
     } finally { clearTimeout(timer); }
   }
 
@@ -187,7 +242,7 @@ export function createWorker(dependencies = {}) {
     if (inFlight.has(key)) return inFlight.get(key);
     if (inFlight.size >= MAX_ENTRIES) throw new SafeError(503, 'BUSY', 'Please wait a moment and retry.');
     const pending = (async () => {
-      const cacheRequest = new Request(`https://mcg-golf-time.internal/cache/v1/${key}`);
+      const cacheRequest = new Request(`https://mcg-golf-time.internal/cache/v2/${key}`);
       let entry = memory.get(key);
       if (!entry && cache) {
         try {
@@ -220,6 +275,12 @@ export function createWorker(dependencies = {}) {
     try { return await pending; } finally { inFlight.delete(key); }
   }
 
+  function availability(courseId, subCourseId, date) {
+    // TenFore's legacy endpoint returns no rows for subCourseID=0, so main courses omit it.
+    const params = { golfCourseID: courseId, ...(subCourseId ? { subCourseID: subCourseId } : {}), startDate: date, endDate: nextDate(date) };
+    return cached(`availability/${courseId}/${subCourseId}/${date}`, AVAILABILITY, async () => sanitizeTimes(await upstream('BookingEngine/Get', params), date));
+  }
+
   return { async fetch(request, env = {}, ctx) {
     const url = new URL(request.url);
     if (url.pathname !== '/api' && !url.pathname.startsWith('/api/')) {
@@ -234,9 +295,23 @@ export function createWorker(dependencies = {}) {
       }
       if (url.pathname === '/api/availability') {
         const query = availabilityQuery(url, now());
-        return json(await cached(`availability/${query.courseId}/${query.subCourseId}/${query.date}`, AVAILABILITY, async () => sanitizeTimes(await upstream('BookingEngine/Get', {
-          golfCourseID: query.courseId, subCourseID: query.subCourseId, startDate: query.date, endDate: nextDate(query.date)
-        }), query.date)));
+        return json(await availability(query.courseId, query.subCourseId, query.date));
+      }
+      if (url.pathname === '/api/day') {
+        parameters(url, ['date']);
+        const date = bookableDate(url, now());
+        const settled = await settleAll(UNITS, DAY_CONCURRENCY, ([courseId, subCourseId]) => availability(courseId, subCourseId, date));
+        const units = settled.map((result, i) => {
+          const [courseId, subCourseId] = UNITS[i];
+          if (result.status === 'fulfilled') return { courseId, subCourseId, ok: true, teeTimes: result.value.teeTimes, meta: result.value.meta };
+          const safe = result.reason instanceof SafeError ? result.reason : new SafeError(502, 'UNAVAILABLE', 'Availability is temporarily unavailable. Please retry.');
+          return { courseId, subCourseId, ok: false, code: safe.code, messageForUser: safe.message };
+        });
+        return json({ date, units, meta: { fetchedAt: new Date(Number(now())).toISOString() } });
+      }
+      if (url.pathname === '/api/weather') {
+        parameters(url, []);
+        return json(await cached('weather', WEATHER, async () => sanitizeWeather(await getJson(WEATHER_URL, 'Weather'))));
       }
       return json({ successful: false, code: 'NOT_FOUND', messageForUser: 'API route not found.' }, 404);
     } catch (error) {

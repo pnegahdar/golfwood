@@ -6,18 +6,25 @@ Current build: `v0.5.0` (`2026-10-19`) — standalone MCG Tee, a cached public r
 
 ## Standalone Cloudflare edition
 
-The hosted site reuses `app.js` and its course layout, player counts, capacity pills, time/score sorting, weather, empty states, and recovery controls. `site/index.html` sets `window.__MCG_HOSTED_APP__ = {apiRoot:'/api'}` before loading the script. When that flag is absent, the original preview/bookmarklet behavior applies.
+The hosted site is its own small frontend in `site/` and no longer loads `app.js` (the bookmarklet keeps using it unchanged). One page shows one day across all eleven bookable units — the nine courses plus Northwest Inside 9 and Needwood Executive 9:
 
-One Cloudflare ESM Worker (`worker.mjs`) handles `/api/*`; all other paths go to the static assets binding. `npm run build` copies only the hosted HTML, favicon, headers, and shared script into a clean `dist/`. Root `index.html` continues to be the GitHub Pages bookmarklet preview. There is no database, polling, scheduled job, authentication, reservation API, payment handling, analytics, or CAPTCHA in the hosted edition.
+- **Top bar:** day strip (today + 7, Eastern; hi/lo, rain ≥20%, and how many tee times fit once that day has loaded), Players 1–4, Holes All/18/9, and **Empty tee times only**. All three filters persist in `localStorage`. After 5pm Eastern the page opens on tomorrow; `?date=YYYY-MM-DD` selects a day.
+- **Day band:** sunrise, sunset, daylight, hi/lo, rain, wind ≥15 mph, a small legend, and “Updated … ago · Refresh”. Returning to the tab refetches when the day is older than 60 seconds.
+- **Desktop (≥900px):** a proportional timeline. Hour axis, hourly temperature/rain strip, dusk shading before sunrise and after sunset, and a now-line for today, which hides past times. One row per unit with “holes · price range · N open”. Each tee time is a block with one pip per spot (filled = booked, hollow = open): green when it fits the party, outlined when it fits but already has players and Empty-only is on, grey and unlinked when too few spots remain. An orange top edge means an 18-hole round (4h15m) or 9-hole round (2h05m) would finish after sunset. Hover/focus shows a tooltip with time, course, booked/open, price, temperature, rain, and estimated finish.
+- **Mobile (<900px):** one section per unit with wrapping time chips, inline hour/temperature and sunset markers. Units with nothing that fits collapse into one line. Add `?layout=mobile` or `?layout=desktop` to force a layout for debugging.
+- A failed unit shows “Couldn’t load · Retry” in its own row and retries only that unit. Weather is optional; without it the page simply omits weather details.
 
-The Worker is named `mcg-golf-time`, deployed at https://mcg-golf-time.support-27c.workers.dev. The chosen domain is `mcgtee.com`; registration and its custom-domain binding are pending. No production credential is checked in.
+Files: `site/index.html`, `site/styles.css`, `site/main.mjs` (state, fetches, rendering), and `site/lib.mjs` (pure helpers, tested by `tests/site.test.mjs`). `site/_headers` sets a same-origin CSP.
+
+One Cloudflare ESM Worker (`worker.mjs`) handles `/api/*`; all other paths go to the static assets binding. `npm run build` copies the `site/` files (HTML, CSS, two modules, favicon, headers) into a clean `dist/`. Root `index.html` continues to be the GitHub Pages bookmarklet preview. There is no database, polling, scheduled job, authentication, reservation API, payment handling, analytics, or CAPTCHA in the hosted edition.
+
+The Worker is named `mcg-golf-time` and runs on the owner's personal Cloudflare account. It is live at https://mcgtee.com, with custom domains `mcgtee.com` and `www.mcgtee.com` (set in `wrangler.jsonc` `routes`), and at https://mcg-golf-time.pnegahdar.workers.dev. No production credential is checked in.
 
 Requires a current Node.js version supported by pinned Wrangler `4.151.2` (Node 22 or newer recommended):
 
 ```bash
 npm ci
 npm test
-node --check app.js
 npm run build
 npx wrangler deploy --dry-run
 ```
@@ -28,12 +35,12 @@ To preview the complete site and Worker locally:
 npm run dev
 ```
 
-Open `http://127.0.0.1:5187/`. No Cloudflare credentials are needed for local development; availability still requires internet access to TenFore. Useful checks are `/api/health`, `/api/courses`, and `/api/availability?courseId=16504&subCourseId=1032&date=YYYY-MM-DD` with a current Eastern date. Stop the preview with Ctrl-C. After Cloudflare authentication and domain setup, the deployment command is `npm run deploy`.
+Open `http://127.0.0.1:5187/`. No Cloudflare credentials are needed for local development; availability still requires internet access to TenFore. Useful checks are `/api/health`, `/api/courses`, `/api/day?date=YYYY-MM-DD`, `/api/weather`, and `/api/availability?courseId=16504&subCourseId=1032&date=YYYY-MM-DD` with a current Eastern date. Stop the preview with Ctrl-C. With Cloudflare credentials for the personal account, the deployment command is `npm run deploy`.
 
-The deployment token is saved as `cloudflare-mcgtee` in the Personal Halfday vault. Deploy from this checkout using the named vault item:
+The deployment token for the personal account is saved as `cloudflare-mcgtee` in the Personal Halfday vault. Deploy from this checkout using the named vault item:
 
 ```bash
-CLOUDFLARE_ACCOUNT_ID=27c7803cb2d4bafbd74014b7c02c3954 "$STATION_CLI" secrets run --env CLOUDFLARE_API_TOKEN=cloudflare-mcgtee -- npm run deploy
+CLOUDFLARE_ACCOUNT_ID=375871b8dc71bb64db4391232d86cec0 "$STATION_CLI" secrets run --env CLOUDFLARE_API_TOKEN=cloudflare-mcgtee -- npm run deploy
 ```
 
 The deployed Worker was checked through its public health, sanitized course list, and live Inside 9 availability endpoints. Its real Workers runtime uses `redirect: 'manual'` and rejects non-success statuses; the runtime does not support the browser/Node `redirect: 'error'` option.
@@ -42,7 +49,9 @@ The deployed Worker was checked through its public health, sanitized course list
 
 - `GET /api/health` returns `{ok:true}`.
 - `GET /api/courses` reads the public `GolfCourse/GetGolfCourseByVanity?vanityName=mcggolf` endpoint. The response contains only the nine MCG courses and an explicit allowlist of display fields, image URLs/types, and the two approved subcourses. Raw metadata, including unrelated payment processor fields, is never proxied.
-- `GET /api/availability?courseId=16504&subCourseId=1032&date=YYYY-MM-DD` calls the ordinary public `BookingEngine/Get` endpoint. Its upstream `startDate` is the selected day and `endDate` is **the following day**. No modern verified endpoint is used as a fallback.
+- `GET /api/availability?courseId=16504&subCourseId=1032&date=YYYY-MM-DD` calls the ordinary public `BookingEngine/Get` endpoint. Its upstream `startDate` is the selected day and `endDate` is **the following day**. For main courses the Worker omits `subCourseID`, because TenFore returns no rows for `subCourseID=0`. No modern verified endpoint is used as a fallback.
+- `GET /api/day?date=YYYY-MM-DD` returns `{date, units:[…], meta:{fetchedAt}}` for all eleven units. Each unit is either `{courseId, subCourseId, ok:true, teeTimes, meta}` or `{courseId, subCourseId, ok:false, code, messageForUser}`. It reuses the per-unit availability cache, so caching, coalescing, and stale fallback still apply. At most four upstream reads run at once, and one failed unit does not fail the day. Date rules match `/api/availability`.
+- `GET /api/weather` reads Open-Meteo once for the county center (39.154, −77.125), in Fahrenheit/mph and Eastern time, for nine days. It returns `{days:{date:{sunrise, sunset, high, low, rainMax, windMax}}, hours:{date:[{hour, temp, rain, wind, code}]}, meta}`, with numbers rounded. It is fresh for 30 minutes, and stale fallback after errors lasts up to six hours. Upstream failures return a safe 502.
 - Courses are limited to Falls Road (16503), Northwest (16504), Hampshire Greens (16506), Laytonsville (16507), Little Bennett (16508), Needwood (16509), Crossvines (16510), Rattlewood (16511), and Sligo Creek (16512). Subcourse 1032 is allowed only for Northwest Inside 9; 1031 only for Needwood Executive 9. Omit `subCourseId` or use `0` for a main course.
 - Dates must round-trip as real calendar dates and fall between today and today + 7 in `America/New_York`, inclusive. Exact integer query values, course/subcourse pairs, supported parameters, and GET-only methods are validated before any upstream request. There is no arbitrary URL proxy or public cache-busting option.
 - Availability is fresh for 60 seconds. If an upstream read fails, the last successful result may be returned only while its total age is at most five minutes, marked `meta.stale:true`. Course metadata is fresh for six hours, with error-only stale fallback up to 24 hours from its successful read. Both responses expose the original `meta.fetchedAt` timestamp. Failures are never cached; successful empty results are.
@@ -53,9 +62,9 @@ The Worker normalizes legacy offsets such as `.000-4` into `.000-04:00`, filters
 
 ### Hosted booking and limits
 
-Book is a normal new-tab link to `https://fox.tenfore.golf/:vanity/tee-time/:id?players=…&holes=…&backToSearch=true`. Modified clicks work naturally. The hosted site does not access TenFore's router or stores. TenFore may reset player/hole choices when opening a direct link, so the table asks visitors to confirm players, holes, and final price there. Availability can change before booking, and all reservations and any sign-in/payment happen on MCG Golf / TenFore.
+Each bookable block/chip is a normal new-tab link to `https://fox.tenfore.golf/:vanity/tee-time/:id?players=…&holes=…&backToSearch=true` (Inside 9 uses `northwest`, Executive 9 uses `needwood`). Modified clicks work naturally. The hosted site does not access TenFore's router or stores. TenFore may reset player/hole choices when opening a direct link, so confirm players, holes, and final price there. Availability can change before booking, and all reservations and any sign-in/payment happen on MCG Golf / TenFore.
 
-Hosted date buttons, custom-date validation, times, and weather matching use Eastern time regardless of the visitor's timezone. After 5pm Eastern the initial selection is tomorrow. Returning to a course/date refreshes a client result older than 60 seconds; Refresh and Retry request the same shared server cache without bypassing it. There is no automatic background polling. A page left open keeps its last check time visible; Refresh requests an updated check.
+Hosted date buttons, times, and weather matching use Eastern time regardless of the visitor's timezone. After 5pm Eastern the initial selection is tomorrow. Switching to a day or returning to the tab refreshes a client result older than 60 seconds. Refresh and Retry use the same shared server cache without bypassing it. There is no automatic background polling. A page left open keeps its last check time visible.
 
 The overlay also exposes `window.__MCG_TEE_PRESSURE_VERSION__` after it runs. If the header does not show this build, replace the old bookmarklet with the one generated by the local preview page.
 
