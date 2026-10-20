@@ -1,0 +1,12 @@
+{
+  "name": "mcg-golf-time",
+  "version": "0.5.0",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build-site.mjs",
+    "test": "node --test tests/*.test.cjs tests/*.test.mjs",
+    "dev": "node scripts/build-site.mjs && wrangler dev --ip 127.0.0.1 --port 5187",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "devDependencies": { "wrangler": "4.151.2" }
+}

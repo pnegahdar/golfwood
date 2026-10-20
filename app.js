@@ -1,6 +1,9 @@
 (function () {
   "use strict";
 
+  var HOSTED = window.__MCG_HOSTED_APP__ || null;
+  var MCG_TIME_ZONE = "America/New_York";
+
   var CONFIG = {
     apiRoot: "https://swan.tenfore.golf/api",
     weatherRoot: "https://api.open-meteo.com/v1/forecast",
@@ -12,9 +15,9 @@
   };
 
   var VERSION = {
-    id: "v0.4.27",
+    id: "v0.5.0",
     changedAt: "2026-10-19",
-    note: "Recover verification during page startup and refresh preview assets"
+    note: "Launch MCG Tee with cached public availability and native booking links"
   };
 
   window.__MCG_TEE_PRESSURE_VERSION__ = VERSION;
@@ -115,6 +118,20 @@
       flex-wrap: wrap;
       gap: 8px;
       justify-content: flex-end;
+    }
+
+    .mcg-app.hosted .mcg-header {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 14px;
+    }
+
+    .mcg-app.hosted .mcg-controls {
+      justify-content: flex-start;
+      min-width: 0;
+    }
+
+    .mcg-app.hosted .mcg-weekdays {
+      justify-content: flex-start;
     }
 
     .mcg-weekdays {
@@ -970,17 +987,20 @@
   ];
 
   var state = {
-    live: location.hostname === CONFIG.host,
+    hosted: !!HOSTED,
+    live: !!HOSTED || location.hostname === CONFIG.host,
     loading: false,
     booted: false,
     courses: [],
     selectedKey: "",
-    date: todayISO(),
+    date: initialDate(),
     draftDate: "",
     players: initialPlayers(),
     sort: initialSort(),
     showCustomDate: false,
     timesByCourse: new Map(),
+    metaByRequest: new Map(),
+    coursesMeta: null,
     debugByCourse: new Map(),
     errorsByCourse: new Map(),
     requestsByCourse: new Map(),
@@ -1020,7 +1040,32 @@
 
   function todayISO() {
     var date = new Date();
+    if (HOSTED) return easternParts(date).date;
     return date.getFullYear() + "-" + String(date.getMonth() + 1).padStart(2, "0") + "-" + String(date.getDate()).padStart(2, "0");
+  }
+
+  function easternParts(date) {
+    var parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: MCG_TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+    }).formatToParts(date).reduce(function (memo, part) { memo[part.type] = part.value; return memo; }, {});
+    return { date: parts.year + "-" + parts.month + "-" + parts.day, hour: Number(parts.hour), minute: Number(parts.minute) };
+  }
+
+  function calendarAdd(value, days) {
+    return new Date(Date.parse(value + "T12:00:00Z") + days * 86400000).toISOString().slice(0, 10);
+  }
+
+  function initialDate() {
+    var today = todayISO();
+    return HOSTED && easternParts(new Date()).hour >= 17 ? calendarAdd(today, 1) : today;
+  }
+
+  function hostedDateValid(value, course) {
+    if (!isISODate(value) || !Number.isFinite(Date.parse(value + "T12:00:00Z"))) return false;
+    if (new Date(value + "T12:00:00Z").toISOString().slice(0, 10) !== value) return false;
+    var daysOut = Math.min(7, course && course.maxBookingDaysOut > 0 ? course.maxBookingDaysOut : 7);
+    return value >= todayISO() && value <= calendarAdd(todayISO(), daysOut);
   }
 
   function isISODate(value) {
@@ -1094,6 +1139,13 @@
   }
 
   function nextSevenChoices() {
+    if (HOSTED) {
+      return Array.from({ length: 8 }, function (_, index) {
+        var value = calendarAdd(todayISO(), index);
+        var date = new Date(value + "T12:00:00Z");
+        return { label: date.toLocaleDateString("en-US", { weekday: "short", timeZone: "UTC" }), shortDate: Number(value.slice(5, 7)) + "/" + Number(value.slice(8, 10)), value: value };
+      });
+    }
     var today = new Date();
     today.setHours(12, 0, 0, 0);
 
@@ -1309,7 +1361,7 @@
     if (!raw) return "";
     var date = new Date(raw);
     if (!Number.isNaN(date.getTime())) {
-      return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      return date.toLocaleTimeString([], Object.assign({ hour: "numeric", minute: "2-digit" }, HOSTED ? { timeZone: MCG_TIME_ZONE } : {}));
     }
     var match = String(raw).match(/(\d{1,2}):(\d{2})/);
     if (!match) return String(raw);
@@ -1618,9 +1670,31 @@
 
   async function loadCourses() {
     if (!state.live) return DEMO_COURSES.map(withCourseCoords);
-    var payload = await api("GolfCourse/GetGolfCourseByVanity", { params: { vanityName: CONFIG.vanityName } });
+    var payload = state.hosted ? await hostedApi("courses") : await api("GolfCourse/GetGolfCourseByVanity", { params: { vanityName: CONFIG.vanityName } });
     if (!payload || !Array.isArray(payload.companyCourses)) throw lookupError("API_RESPONSE", "TenFore couldn’t load the course list. Please retry.");
+    if (state.hosted) state.coursesMeta = payload.meta;
     return normalizeCourses(payload);
+  }
+
+  async function hostedApi(path, params) {
+    var url = new URL((HOSTED.apiRoot || "/api").replace(/\/$/, "") + "/" + path, location.href);
+    if (url.origin !== new URL(location.href).origin) throw lookupError("API_RESPONSE", "The availability service must use this site’s origin.");
+    Object.entries(params || {}).forEach(function (entry) { url.searchParams.set(entry[0], entry[1]); });
+    var controller = new AbortController();
+    try {
+      return await withTimeout((async function () {
+        var response = await fetch(url.toString(), { method: "GET", credentials: "omit", cache: "no-store", headers: { Accept: "application/json" }, signal: controller.signal });
+        var body = safeJSON(await response.text());
+        if (!response.ok || !body || body.successful === false || body.status && body.status.successful === false) {
+          var message = body && body.messageForUser;
+          throw lookupError(body && body.code || "API_REJECTED", typeof message === "string" ? message : "Couldn’t check availability. Please retry.");
+        }
+        return body;
+      })(), 15000, lookupError("API_TIMEOUT", "The availability check took too long. Please retry."));
+    } catch (error) {
+      if (error && error.name === "AvailabilityError") throw error;
+      throw lookupError("API_NETWORK", "Couldn’t reach the availability service. Check your connection and retry.");
+    } finally { controller.abort(); }
   }
 
   function weatherKey(course, date) {
@@ -1884,6 +1958,22 @@
     var debug = makeDebug(course, state.live ? "live" : "preview", date);
     state.debugByCourse.set(requestKey(course, date), debug);
 
+    if (state.hosted) {
+      debug.used = "BookingEngine/Get";
+      try {
+        var hostedPayload = await hostedApi("availability", { courseId: course.id, subCourseId: course.subCourseId || 0, date: date });
+        if (!Array.isArray(hostedPayload.teeTimes) || !hostedPayload.status || hostedPayload.status.successful !== true || !hostedPayload.meta || typeof hostedPayload.meta.stale !== "boolean" || !Number.isFinite(Date.parse(hostedPayload.meta.fetchedAt))) {
+          throw lookupError("API_RESPONSE", "The availability service returned an unexpected response. Please retry.");
+        }
+        var hostedTimes = hostedPayload.teeTimes.map(function (raw) {
+          return normalizeTime(Object.assign({}, raw, { maxPlayers: raw.maxPlayers || raw.maxSlots }), course);
+        });
+        state.metaByRequest.set(requestKey(course, date), hostedPayload.meta);
+        debug.search.raw = debug.search.matched = debug.search.available = hostedTimes.length;
+        return hostedTimes;
+      } catch (error) { debug.search.error = errorDetails(error); throw error; }
+    }
+
     if (!state.live) {
       await new Promise(function (resolve) { setTimeout(resolve, 120); });
       return demoTimes(course, date);
@@ -2040,6 +2130,7 @@
 
   function slotMinutes(slot) {
     var date = new Date(slot.rawTime);
+    if (HOSTED && !Number.isNaN(date.getTime())) { var parts = easternParts(date); return parts.hour * 60 + parts.minute; }
     if (!Number.isNaN(date.getTime())) return date.getHours() * 60 + date.getMinutes();
 
     var text = String(slot.timeText || slot.rawTime || "");
@@ -2108,7 +2199,7 @@
 
     state.shadow.innerHTML = [
       "<style>", STYLE, "</style>",
-      '<div class="mcg-app"><div class="mcg-shell"><div class="mcg-panel">',
+      '<div class="mcg-app', state.hosted ? " hosted" : "", '"><div class="mcg-shell"><div class="mcg-panel">',
       renderHeader(course),
       '<div class="mcg-body">',
       renderSidebar(),
@@ -2126,15 +2217,15 @@
       '<header class="mcg-header">',
       '<div class="mcg-title-row">',
       '<div class="mcg-mark">MCG</div>',
-      '<div><h1 class="mcg-title">Tee-time pressure</h1>',
-      '<div class="mcg-subtitle">', escapeHTML(course ? course.fullName : "MCG Golf"), state.live ? " live availability" : " preview data", "</div></div>",
+      '<div><h1 class="mcg-title">', state.hosted ? "MCG Tee" : "Tee-time pressure", '</h1>',
+      '<div class="mcg-subtitle">', escapeHTML(course ? course.fullName : "MCG Golf"), state.hosted ? " · Eastern time" : state.live ? " live availability" : " preview data", "</div></div>",
       "</div>",
       '<div class="mcg-controls">',
       renderWeekdayButtons(),
       renderPlayerControl(),
       renderSortButtons(),
       '<button class="mcg-button" data-action="refresh"', state.loading ? " disabled" : "", ">", state.loading ? "Loading" : "Refresh", "</button>",
-      state.live ? '<button class="mcg-button secondary" data-action="close">Exit</button>' : "",
+      state.live && !state.hosted ? '<button class="mcg-button secondary" data-action="close">Exit</button>' : "",
       "</div></header>"
     ].join("");
   }
@@ -2159,7 +2250,7 @@
       '<button type="button" class="mcg-chip', selectedDateInNextSeven() ? "" : " active", '" data-action="custom-date">Date</button>',
       state.showCustomDate ? [
         '<span class="mcg-date-custom">',
-        '<input class="mcg-input mcg-custom-date" data-action="date-draft" type="date" value="' + escapeHTML(customValue) + '">',
+        '<input class="mcg-input mcg-custom-date" data-action="date-draft" type="date" value="' + escapeHTML(customValue) + '"' + (state.hosted ? ' min="' + todayISO() + '" max="' + calendarAdd(todayISO(), Math.min(7, course && course.maxBookingDaysOut > 0 ? course.maxBookingDaysOut : 7)) + '"' : '') + '>',
         '<button type="button" class="mcg-chip mcg-date-apply" data-action="apply-date">Go</button>',
         "</span>"
       ].join("") : "",
@@ -2216,6 +2307,15 @@
       content = '<span class="mcg-spinner"></span><span>' + (state.coursesLoading ? "Loading MCG courses…" : "Checking tee times…") + '</span>';
     } else if (state.error) {
       content = '<span>Availability check failed. Retry below or use TenFore.</span>';
+    } else if (state.hosted) {
+      var course = selectedCourse();
+      var meta = course && state.metaByRequest.get(requestKey(course));
+      if (meta) {
+        var checked = new Date(meta.fetchedAt).toLocaleString("en-US", { timeZone: MCG_TIME_ZONE, month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" });
+        var stale = meta.stale || Date.now() - Date.parse(meta.fetchedAt) >= 60000;
+        content = '<span>' + (stale ? "Cached availability · " : "Availability checked · ") + escapeHTML(checked) + ' ET' + (meta.stale ? ' · TenFore is unavailable; showing an older check. Retry to update.' : stale ? ' · Refresh for an updated check.' : ' · Cached for up to 60 seconds.') + '</span>';
+      }
+      if (state.coursesMeta && state.coursesMeta.stale) content += '<span>Course details are cached while TenFore is unavailable.</span>';
     } else if (!state.live) {
       content = "<span>Preview mode. Live calls run from fox.tenfore.golf because TenFore requires a reCAPTCHA token for that domain.</span>";
     }
@@ -2239,13 +2339,14 @@
 
   function renderTimes(course, times) {
     var title = course ? course.label : "Course";
-    var content = times.length ? renderTimeTable(course, times) : renderEmpty(course);
+    var content = times.length && !(state.hosted && state.error) ? renderTimeTable(course, times) : renderEmpty(course);
     return [
       '<section>',
       '<div class="mcg-section-head"><div>',
       '<div class="mcg-section-title">', escapeHTML(title), "</div>",
       "</div></div>",
       renderBookingStatus(),
+      state.hosted ? '<p class="mcg-micro">Book opens TenFore in a new tab. Confirm players, holes, and final price there; TenFore may reset your choices.</p>' : "",
       '<div class="mcg-times">', content, "</div>",
       "</section>"
     ].join("");
@@ -2282,7 +2383,7 @@
     } else if (error) {
       title = "Couldn’t check tee times";
       message = availabilityMessage(error);
-      actions = '<div class="mcg-recovery-actions"><button class="mcg-button" data-action="retry">Retry</button>' + (state.live ? '<button class="mcg-button secondary" data-action="close">Use TenFore</button>' : "") + '</div>';
+      actions = '<div class="mcg-recovery-actions"><button class="mcg-button" data-action="retry">Retry</button>' + (state.hosted ? '<a class="mcg-button secondary" href="https://' + CONFIG.host + '/' + encodeURIComponent(course && course.vanityName || CONFIG.vanityName) + '" target="_blank" rel="noopener">Use TenFore</a>' : state.live ? '<button class="mcg-button secondary" data-action="close">Use TenFore</button>' : "") + '</div>';
     } else {
       title = "No tee times available";
       message = "TenFore returned no tee times for " + course.label + " on " + state.date + ". Try another date.";
@@ -2333,7 +2434,7 @@
       '<td><span class="mcg-price">', escapeHTML(price), "</span></td>",
       '<td><span class="mcg-table-weather" title="', escapeHTML(weather.title || "hourly weather"), '">', escapeHTML(weather.label || "-"), "</span></td>",
       '<td class="mcg-table-action">',
-      bookUrl ? '<a class="mcg-link" href="' + escapeHTML(nativeUrl) + '" data-book-slot="' + escapeHTML(slot.id) + '"' + (state.bookingSlotId ? ' aria-disabled="true"' : '') + '>' + (String(state.bookingSlotId) === String(slot.id) ? 'Opening…' : 'Book') + '</a>' : '<span class="mcg-micro" title="' + escapeHTML("Only " + slot.available + " open") + '">' + escapeHTML(unbookableLabel) + "</span>",
+      bookUrl ? '<a class="mcg-link" href="' + escapeHTML(nativeUrl) + '"' + (state.hosted ? ' target="_blank" rel="noopener"' : ' data-book-slot="' + escapeHTML(slot.id) + '"') + (state.bookingSlotId ? ' aria-disabled="true"' : '') + '>' + (String(state.bookingSlotId) === String(slot.id) ? 'Opening…' : 'Book') + '</a>' : '<span class="mcg-micro" title="' + escapeHTML("Only " + slot.available + " open") + '">' + escapeHTML(unbookableLabel) + "</span>",
       "</td></tr>"
     ].join("");
   }
@@ -2514,7 +2615,7 @@
 
   async function setSelectedDate(value) {
     state.bookingError = "";
-    state.date = isISODate(value) ? value : todayISO();
+    state.date = state.hosted ? String(value || "") : isISODate(value) ? value : todayISO();
     state.draftDate = state.date;
     state.showCustomDate = false;
     await ensureSelectedTimes();
@@ -2630,10 +2731,17 @@
     if (!course || state.coursesError) return render();
     var date = state.date;
     var key = requestKey(course, date);
+    if (state.hosted && !hostedDateValid(date, course)) {
+      state.errorsByCourse.set(key, lookupError("INVALID_DATE", "Choose a valid date within this course’s booking window, from today through seven days ahead (Eastern time)."));
+      render();
+      return;
+    }
     ensureWeather(course, date).then(function () {
       if (!state.disposed && selectedCourse() && requestKey(selectedCourse()) === key) render();
     });
 
+    var meta = state.metaByRequest.get(key);
+    if (state.hosted && (!meta || meta.stale || Date.now() - Date.parse(meta.fetchedAt) >= 60000)) state.timesByCourse.delete(key);
     if (state.timesByCourse.has(key)) {
       state.errorsByCourse.delete(key);
       render();
