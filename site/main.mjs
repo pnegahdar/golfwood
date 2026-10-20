@@ -177,7 +177,10 @@ function timeView(row, time, ctx) {
   const weather = lib.hourWeather(ctx.hours, time.minute);
   const late = lib.finishesAfterSunset(time.minute, row.unit.holes, ctx.sunset);
   const label = lib.describeTime({ time, unit: row.unit, players: state.players, weather, sunset: ctx.sunset });
-  return { fit: state_, late, label, href: state_ === 'none' ? '' : lib.bookingUrl(row.unit, time, state.players), fkey: `t-${row.unit.key}-${time.teeTimeID}` };
+  const href = state_ === 'none' ? '' : lib.bookingUrl(row.unit, time, state.players);
+  // TenFore preselects every open spot, so remind people to pick their party size there.
+  const tip = href ? `${label} · Book on TenFore, then set ${state.players} player${state.players === 1 ? '' : 's'}` : label;
+  return { fit: state_, late, label, tip, href, fkey: `t-${row.unit.key}-${time.teeTimeID}` };
 }
 
 // ---- Rendering ----
@@ -288,7 +291,7 @@ function renderTimeline(rows, ctx) {
       const cls = `tt ${v.fit}${v.fit === 'fit' && time.availableSlots < time.maxSlots ? ' busy' : ''}${v.late ? ' late' : ''}`;
       const style = `left:${x(time.minute)};width:${rowWidth}`;
       return v.href
-        ? `<a class="${cls}" style="${style}" href="${esc(v.href)}" target="_blank" rel="noopener" data-tip="${esc(v.label)}" aria-label="${esc(`${v.label}. Book on TenFore`)}" data-fkey="${esc(v.fkey)}">${pips(time)}</a>`
+        ? `<a class="${cls}" style="${style}" href="${esc(v.href)}" target="_blank" rel="noopener" data-tip="${esc(v.tip)}" aria-label="${esc(v.tip)}" data-fkey="${esc(v.fkey)}">${pips(time)}</a>`
         : `<span class="${cls}" style="${style}" data-tip="${esc(v.label)}" aria-label="${esc(v.label)}" role="img">${pips(time)}</span>`;
     }).join('');
     return `<div class="tl-line tl-row" data-unit="${row.unit.key}">
@@ -325,7 +328,7 @@ function renderMobile(rows, ctx) {
       const cls = `chip ${v.fit}${v.fit === 'fit' && time.availableSlots < time.maxSlots ? ' busy' : ''}${v.late ? ' late' : ''}`;
       const inner = `<span class="chip-time">${lib.formatClock(time.minute)}</span>${pips(time)}`;
       chips += v.href
-        ? `<a class="${cls}" href="${esc(v.href)}" target="_blank" rel="noopener" aria-label="${esc(`${v.label}. Book on TenFore`)}" data-fkey="${esc(v.fkey)}">${inner}</a>`
+        ? `<a class="${cls}" href="${esc(v.href)}" target="_blank" rel="noopener" aria-label="${esc(v.tip)}" data-fkey="${esc(v.fkey)}">${inner}</a>`
         : `<span class="${cls}" aria-label="${esc(v.label)}" role="img">${inner}</span>`;
     }
     return `<section class="m-unit" data-unit="${row.unit.key}">
@@ -352,7 +355,7 @@ function render() {
   const desktop = isWide();
   root.className = desktop ? 'layout-desktop' : 'layout-mobile';
   root.innerHTML = `${renderHeader()}${renderBand(ctx)}<main>${desktop ? renderTimeline(rows, ctx) : renderMobile(rows, ctx)}</main>
-    <footer class="foot">Independent finder. Booking, prices, and final availability on <a href="https://fox.tenfore.golf/mcggolf" target="_blank" rel="noopener">MCG Golf / TenFore</a>.</footer>`;
+    <footer class="foot">Independent finder. Tap a tee time to book on <a href="https://fox.tenfore.golf/mcggolf" target="_blank" rel="noopener">MCG Golf / TenFore</a>. TenFore preselects every open spot, so set your player count there. Prices and final availability are TenFore&rsquo;s.</footer>`;
   for (const [sel, left] of scrollers) { const el = document.querySelector(sel); if (el) el.scrollLeft = left; }
   if (!scrollers[1][1]) document.querySelector('.day.is-on')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
   if (focusKey) root.querySelector(`[data-fkey="${CSS.escape(focusKey)}"]`)?.focus({ preventScroll: true });

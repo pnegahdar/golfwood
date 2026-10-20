@@ -62,7 +62,7 @@ The Worker normalizes legacy offsets such as `.000-4` into `.000-04:00`, filters
 
 ### Hosted booking and limits
 
-Each bookable block/chip is a normal new-tab link to `https://fox.tenfore.golf/:vanity/tee-time/:id?players=…&holes=…&backToSearch=true` (Inside 9 uses `northwest`, Executive 9 uses `needwood`). Modified clicks work naturally. The hosted site does not access TenFore's router or stores. TenFore may reset player/hole choices when opening a direct link, so confirm players, holes, and final price there. Availability can change before booking, and all reservations and any sign-in/payment happen on MCG Golf / TenFore.
+Each bookable block/chip is a normal new-tab link to `https://fox.tenfore.golf/gctt/:courseId/:teeTimeId?players=…&holes=…`. TenFore's `/:vanity/tee-time/:id` route crashes (500, `reading 'vanityName'`) in any tab that hasn't already loaded the course, so it can't be used from another site; `/gctt/` loads the course itself and was verified cold in a fresh tab on Oct 19, 2026. `/gctt/` ignores `players`/`holes` and preselects every open spot, so the page tells visitors to set their player count on TenFore. Modified clicks work naturally. The hosted site does not access TenFore's router or stores. Availability can change before booking, and all reservations and any sign-in/payment happen on MCG Golf / TenFore.
 
 Hosted date buttons, times, and weather matching use Eastern time regardless of the visitor's timezone. After 5pm Eastern the initial selection is tomorrow. Switching to a day or returning to the tab refreshes a client result older than 60 seconds. Refresh and Retry use the same shared server cache without bypassing it. There is no automatic background polling. A page left open keeps its last check time visible.
 

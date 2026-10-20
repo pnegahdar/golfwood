@@ -83,10 +83,10 @@ test('finish time flags rounds that end after sunset', () => {
 test('booking URLs use each unit vanity, players and holes', () => {
   const units = lib.deriveUnits(lib.FALLBACK_COURSES);
   const inside = new URL(lib.bookingUrl(units.find(u => u.key === '16504:1032'), { teeTimeID: 11495453 }, 3));
-  assert.equal(inside.origin + inside.pathname, 'https://fox.tenfore.golf/northwest/tee-time/11495453');
-  assert.deepEqual(Object.fromEntries(inside.searchParams), { players: '3', holes: '9', backToSearch: 'true' });
-  assert.equal(lib.bookingUrl(units.find(u => u.key === '16510:0'), { teeTimeID: 42 }, 2), 'https://fox.tenfore.golf/crossvines/tee-time/42?players=2&holes=18&backToSearch=true');
-  assert.equal(lib.bookingUrl(units.find(u => u.key === '16509:1031'), { teeTimeID: 'a-1' }, 1), 'https://fox.tenfore.golf/needwood/tee-time/a-1?players=1&holes=9&backToSearch=true');
+  assert.equal(inside.origin + inside.pathname, 'https://fox.tenfore.golf/gctt/16504/11495453');
+  assert.deepEqual(Object.fromEntries(inside.searchParams), { players: '3', holes: '9' });
+  assert.equal(lib.bookingUrl(units.find(u => u.key === '16510:0'), { teeTimeID: 42 }, 2), 'https://fox.tenfore.golf/gctt/16510/42?players=2&holes=18');
+  assert.equal(lib.bookingUrl(units.find(u => u.key === '16509:1031'), { teeTimeID: 'a-1' }, 1), 'https://fox.tenfore.golf/gctt/16509/a-1?players=1&holes=9');
 });
 
 test('price ranges skip unknown prices', () => {

@@ -176,11 +176,14 @@ export function formatPriceRange(range) {
   return range.min === range.max ? formatPrice(range.min) : `${formatPrice(range.min)}–${formatPrice(range.max)}`;
 }
 
+// TenFore's /:vanity/tee-time/:id page crashes unless the course is already loaded in that tab,
+// which is never true for a new tab opened from here. /gctt/:courseId/:id loads the course itself.
+// It currently ignores players/holes (players defaults to every open spot); they are kept in case
+// TenFore starts honoring them.
 export function bookingUrl(unit, time, players) {
-  const url = new URL(`/${encodeURIComponent(unit.vanityName)}/tee-time/${encodeURIComponent(time.teeTimeID)}`, BOOKING_HOST);
+  const url = new URL(`/gctt/${encodeURIComponent(unit.courseId)}/${encodeURIComponent(time.teeTimeID)}`, BOOKING_HOST);
   url.searchParams.set('players', String(players));
   url.searchParams.set('holes', String(unit.holes === 9 ? 9 : 18));
-  url.searchParams.set('backToSearch', 'true');
   return url.toString();
 }
 
