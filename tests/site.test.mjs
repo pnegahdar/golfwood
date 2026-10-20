@@ -78,6 +78,9 @@ test('finish time flags rounds that end after sunset', () => {
   assert.equal(lib.describeTime({ time: t(14 * 60 + 25, 2, { priceBeforeTax: 29 }), unit, players: 2, weather: { temp: 52, rain: 10 }, sunset }),
     '2:25 PM · Northwest · 2 booked · 2 open · $29 · 52° · 10% rain · finishes ~6:40 PM, after sunset');
   assert.match(lib.describeTime({ time: t(490, 1), unit, players: 3, weather: null, sunset }), /^8:10 AM · Northwest · 3 booked · 1 open · finishes ~12:25 PM · not enough spots for 3$/);
+  assert.match(lib.describeTime({ time: t(490, 4, { rate: 62, rateSource: 'ratecard' }), unit: { courseId: 16503, name: 'Falls Road', holes: 18 }, players: 2, weather: null, sunset }), / · \$62 public rate · /);
+  assert.match(lib.describeTime({ time: t(490, 4, { rate: 80, rateSource: 'ratecard' }), unit: { courseId: 16506, name: 'Hampshire Greens', holes: 18 }, players: 2, weather: null, sunset }), / · \$80 public rate incl\. cart · /);
+  assert.match(lib.describeTime({ time: t(490, 4, { priceBeforeTax: 29, rate: 29, rateSource: 'teetime' }), unit: { courseId: 16504, name: 'Northwest Inside 9', holes: 9 }, players: 2, weather: null, sunset }), / · \$29 · finishes/);
 });
 
 test('booking URLs use each unit vanity, players and holes', () => {
@@ -94,6 +97,8 @@ test('price ranges skip unknown prices', () => {
   assert.equal(lib.formatPriceRange(lib.priceRange([t(1, 4, { priceBeforeTax: 45 }), t(2), t(3, 4, { priceBeforeTax: 29 })])), '$29–$45');
   assert.equal(lib.formatPriceRange(lib.priceRange([t(1, 4, { priceBeforeTax: 35.5 })])), '$35.50');
   assert.equal(lib.formatPriceRange(null), '');
+  assert.equal(lib.formatPriceRange(lib.priceRange([t(1, 4, { rate: 62, rateSource: 'ratecard' }), t(2, 4, { rate: 70 })])), '$62–$70', 'uses rate-card prices');
+  assert.equal(lib.priceOf(t(1, 4, { rate: null, priceBeforeTax: 0 })), null);
 });
 
 test('formatting and tints', () => {

@@ -16,7 +16,7 @@ The hosted site is its own small frontend in `site/` and no longer loads `app.js
 
 Files: `site/index.html`, `site/styles.css`, `site/main.mjs` (state, fetches, rendering), and `site/lib.mjs` (pure helpers, tested by `tests/site.test.mjs`). `site/_headers` sets a same-origin CSP.
 
-One Cloudflare ESM Worker (`worker.mjs`) handles `/api/*`; all other paths go to the static assets binding. `npm run build` copies the `site/` files (HTML, CSS, two modules, favicon, headers) into a clean `dist/`. Root `index.html` continues to be the GitHub Pages bookmarklet preview. There is no database, polling, scheduled job, authentication, reservation API, payment handling, analytics, or CAPTCHA in the hosted edition.
+One Cloudflare ESM Worker handles `/api/*`; all other paths go to the static assets binding. `worker.mjs` is only the entry point: it exports the Worker and the `UpstreamCache` Durable Object. Everything testable lives in `api.mjs`: input validation, sanitizers, the rate card, the cache core (`createUpstreamCache`), the upstream service that runs inside the Durable Object (`createUpstreamService`), and the Worker routes (`createWorker`). `npm run build` copies the `site/` files (HTML, CSS, two modules, favicon, headers) into a clean `dist/`. Root `index.html` continues to be the GitHub Pages bookmarklet preview. There is no database beyond the Durable Object's cache storage, and no polling, scheduled job, authentication, reservation API, payment handling, analytics, or CAPTCHA in the hosted edition.
 
 The Worker is named `mcg-golf-time` and runs on the owner's personal Cloudflare account. It is live at https://mcgtee.com, with custom domains `mcgtee.com` and `www.mcgtee.com` (set in `wrangler.jsonc` `routes`), and at https://mcg-golf-time.pnegahdar.workers.dev. No production credential is checked in.
 
@@ -50,15 +50,41 @@ The deployed Worker was checked through its public health, sanitized course list
 - `GET /api/health` returns `{ok:true}`.
 - `GET /api/courses` reads the public `GolfCourse/GetGolfCourseByVanity?vanityName=mcggolf` endpoint. The response contains only the nine MCG courses and an explicit allowlist of display fields, image URLs/types, and the two approved subcourses. Raw metadata, including unrelated payment processor fields, is never proxied.
 - `GET /api/availability?courseId=16504&subCourseId=1032&date=YYYY-MM-DD` calls the ordinary public `BookingEngine/Get` endpoint. Its upstream `startDate` is the selected day and `endDate` is **the following day**. For main courses the Worker omits `subCourseID`, because TenFore returns no rows for `subCourseID=0`. No modern verified endpoint is used as a fallback.
-- `GET /api/day?date=YYYY-MM-DD` returns `{date, units:[…], meta:{fetchedAt}}` for all eleven units. Each unit is either `{courseId, subCourseId, ok:true, teeTimes, meta}` or `{courseId, subCourseId, ok:false, code, messageForUser}`. It reuses the per-unit availability cache, so caching, coalescing, and stale fallback still apply. At most four upstream reads run at once, and one failed unit does not fail the day. Date rules match `/api/availability`.
-- `GET /api/weather` reads Open-Meteo once for the county center (39.154, −77.125), in Fahrenheit/mph and Eastern time, for nine days. It returns `{days:{date:{sunrise, sunset, high, low, rainMax, windMax}}, hours:{date:[{hour, temp, rain, wind, code}]}, meta}`, with numbers rounded. It is fresh for 30 minutes, and stale fallback after errors lasts up to six hours. Upstream failures return a safe 502.
+- `GET /api/day?date=YYYY-MM-DD` returns `{date, units:[…], meta:{fetchedAt}}` for all eleven units. Each unit is either `{courseId, subCourseId, ok:true, teeTimes, meta}` or `{courseId, subCourseId, ok:false, code, messageForUser}`. The Durable Object assembles the whole day from the same per-unit cache entries as `/api/availability`, plus rate cards. One failed unit does not fail the day. Date rules match `/api/availability`.
+- `GET /api/weather` reads Open-Meteo once for the county center (39.154, −77.125), in Fahrenheit/mph and Eastern time, for nine days. It returns `{days:{date:{sunrise, sunset, high, low, rainMax, windMax}}, hours:{date:[{hour, temp, rain, wind, code}]}, meta}`, with numbers rounded. Upstream failures return a safe 502.
 - Courses are limited to Falls Road (16503), Northwest (16504), Hampshire Greens (16506), Laytonsville (16507), Little Bennett (16508), Needwood (16509), Crossvines (16510), Rattlewood (16511), and Sligo Creek (16512). Subcourse 1032 is allowed only for Northwest Inside 9; 1031 only for Needwood Executive 9. Omit `subCourseId` or use `0` for a main course.
 - Dates must round-trip as real calendar dates and fall between today and today + 7 in `America/New_York`, inclusive. Exact integer query values, course/subcourse pairs, supported parameters, and GET-only methods are validated before any upstream request. There is no arbitrary URL proxy or public cache-busting option.
-- Availability is fresh for 60 seconds. If an upstream read fails, the last successful result may be returned only while its total age is at most five minutes, marked `meta.stale:true`. Course metadata is fresh for six hours, with error-only stale fallback up to 24 hours from its successful read. Both responses expose the original `meta.fetchedAt` timestamp. Failures are never cached; successful empty results are.
-- Concurrent identical requests coalesce within an isolate. The Cloudflare Cache API shares sanitized entries at a data center; a bounded in-memory map supports local use and cache outages. Cache/coalescing is not global across every Cloudflare region. Client responses use `Cache-Control: no-store` so freshness metadata remains accurate. No wildcard CORS is enabled.
+- **One global cache.** Every TenFore and Open-Meteo request happens inside a single SQLite-backed Durable Object (`UpstreamCache`, addressed as `idFromName('global')`). Worldwide, there is at most one upstream request per cache key per freshness window. The Worker validates input and then makes exactly one Durable Object request per API call. Durable Objects with SQLite storage are available on Workers Free; KV is not used.
+- Entries are stored as `{value, fetchedAt}` in Durable Object storage, with an in-memory copy. A fresh entry is returned as-is. A stale entry still inside its maximum stale age is returned immediately, and one background refresh starts. A missing or expired entry waits for one coalesced fetch.
+- Freshness windows:
+
+  | Data | Fresh for | Served stale for up to |
+  |---|---|---|
+  | Availability, today and tomorrow (Eastern) | 2 min | 30 min |
+  | Availability, days 2–7 | 10 min | 30 min |
+  | Course metadata and rate cards | 24 h | 7 days |
+  | Weather | 30 min | 6 h |
+
+- Responses carry the original `meta.fetchedAt` (the page's "Updated … ago") and `meta.stale:true` once an entry is past its fresh window.
+- A failed upstream read is never cached. It starts a 30-second per-key backoff with no upstream retries. Within the stale window, the stale entry keeps being served; past it, the client gets a safe error. At most four upstream requests run at once inside the Durable Object. Availability entries for past days are pruned once per Eastern day.
+- The Worker also keeps successful `/api/day`, `/api/courses`, and `/api/weather` responses in the local data center's Cache API for 30 seconds, to save Durable Object requests. Browsers still get `Cache-Control: no-store`, so freshness metadata remains accurate. The client refetches on focus or day switch when its copy is older than two minutes. No wildcard CORS is enabled.
+- Free-plan budget to watch: one Durable Object request per uncached API call (100k/day free), plus one storage write per upstream refresh. That is about 10k–25k writes/day if the site is busy all day, against a 100k/day free allowance.
 - Upstream reads time out after ten seconds, and hosted client reads after fifteen seconds. Bad envelopes, verification pages, invalid schemas, and HTTP failures show recoverable errors rather than an empty success. Errors expose safe messages, not raw upstream diagnostics.
 
-The Worker normalizes legacy offsets such as `.000-4` into `.000-04:00`, filters to the selected Eastern date, and preserves authoritative `availableSlots` remaining capacity. `maxSlots` is total capacity, not another count to subtract. Rows include no customer data. Positive listing/fee prices are shown; zero or missing prices stay unknown, never advertised as free.
+The Worker normalizes legacy offsets such as `.000-4` into `.000-04:00`, filters to the selected Eastern date, and preserves authoritative `availableSlots` remaining capacity. `maxSlots` is total capacity, not another count to subtract. Rows include no customer data. Positive listing/fee prices are kept as `priceBeforeTax`. Zero or missing prices stay unknown, never advertised as free.
+
+### Prices (public rate card)
+
+TenFore returns $0 prices for main-course tee times, so prices come from the public rate card `GET https://swan.tenfore.golf/api/TeeFees?golfCourseID=N`, which needs no auth.
+- Only `everyone:true` rows are kept, as `{title, start, end (minutes), days, startDate, endDate, price9, price18}`. Member, senior, and junior rates never leave the Durable Object.
+- `publicRate(fees, unit, teeTimeISO)` in `api.mjs` picks the rows that match the tee time's Eastern weekday, date range, and minute. `subCourseID` is null even for subcourse rows, so rows are scoped by title: "Inside 9" rows apply only to Northwest Inside 9, "Exec" rows only to Needwood Executive 9, and all other rows only to main courses.
+- Price is `price9` for 9-hole units (Inside 9, Exec 9, Sligo Creek) and `price18` otherwise. Values ≤ $0 or > $300 are ignored; Sligo's 18-hole price is listed as $500. If several rows match, the narrowest time window wins.
+- Every tee time in `/api/day` and `/api/availability` gets `rate` and `rateSource`:
+  - `teetime`: the feed's own positive price.
+  - `ratecard`: the public rate.
+  - `null`: no price found.
+- On Oct 20, 2026, the rate card agreed with all 131 Inside 9 and Exec 9 feed prices: Inside 9 is $29 before 3 PM on weekdays and $27 after, and Exec 9 is $24 on weekdays.
+- The page shows prices like "$62 public rate", adds "incl. cart" for Hampshire Greens and Little Bennett, and says in the footer that these are public walking rates.
 
 ### Hosted booking and limits
 

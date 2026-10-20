@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createWorker } from '../worker.mjs';
+import { createUpstreamService, createWorker, memoryStorage } from '../api.mjs';
 
 const START = Date.parse('2026-10-20T14:00:00Z');
 const row = (extra = {}) => ({ teeTimeID: 123, dateScheduled: '2026-10-20T08:00:00.000-4', availableSlots: 2, maxSlots: 4, listingPrice: 29, ...extra });
@@ -8,11 +8,21 @@ const times = (rows = [row()]) => ({ teeTimes: rows, status: { successful: true 
 const response = (body, status = 200) => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status });
 const request = (query = 'courseId=16504&subCourseId=1032&date=2026-10-20', options) => new Request(`https://example.test/api/availability?${query}`, options);
 const course = (extra = {}) => ({ golfCourseID: 16504, courseName: 'Northwest Golf Course', vanityName: 'northwest', maxBookingPlayers: 4, minBookingPlayers: 1, defaultNumberOfHoles: 18, maxBookingDaysOut: 7, images: [{ imageTypeID: 15, imageURL: 'https://firebasestorage.googleapis.com/public.png', secret: 'secret' }], subCourses: [{ subCourseID: 1032, name: 'Inside 9', processorKey: 'secret' }, { subCourseID: 777, name: 'Other' }], paymentProcessorKey: 'secret', ...extra });
+const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+// The Worker talks to an in-process upstream service, as it would to the Durable Object.
+// Rate-card (TeeFees) reads are answered by `feeImpl` and counted separately from `calls`.
 function harness(fetchImpl = async () => response(times()), options = {}) {
   let clock = START;
-  const calls = [];
-  const worker = createWorker({ now: () => clock, cacheStorage: null, fetchImpl: async (...args) => { calls.push(args); return fetchImpl(...args); }, ...options });
-  return { worker, calls, advance(ms) { clock += ms; }, fetch: (req = request(), env) => worker.fetch(req, env) };
+  const now = options.now || (() => clock);
+  const calls = [], feeCalls = [];
+  const storage = options.storage || memoryStorage();
+  const service = createUpstreamService({ now, storage, timeoutMs: options.timeoutMs, fetchImpl: async (url, init) => {
+    if (String(url).includes('/api/TeeFees')) { feeCalls.push(url); return options.feeImpl ? options.feeImpl(url) : response({ teeFees: [] }); }
+    calls.push([url, init]);
+    return fetchImpl(url, init);
+  } });
+  const worker = createWorker({ now, upstream: service, cacheStorage: options.cacheStorage ?? null });
+  return { worker, service, storage, calls, feeCalls, advance(ms) { clock += ms; }, fetch: (req = request(), env) => worker.fetch(req, env) };
 }
 
 test('validates exact integers, known courses, subcourse pairs, dates, duplicates and query allowlist before fetching', async () => {
@@ -48,9 +58,11 @@ test('uses only the legacy GET with next-day end and preserves remaining capacit
   });
   const res = await h.fetch();
   const body = await res.json();
-  assert.deepEqual(body.teeTimes[0], { teeTimeID: 123, dateScheduled: '2026-10-20T08:00:00.000-04:00', availableSlots: 2, maxSlots: 4, maxPlayers: 4, priceBeforeTax: 29 });
+  assert.deepEqual(body.teeTimes[0], { teeTimeID: 123, dateScheduled: '2026-10-20T08:00:00.000-04:00', availableSlots: 2, maxSlots: 4, maxPlayers: 4, priceBeforeTax: 29, rate: 29, rateSource: 'teetime' });
   assert.equal(body.teeTimes.length, 3);
   assert.equal(body.teeTimes[1].priceBeforeTax, null);
+  assert.equal(body.teeTimes[1].rate, null);
+  assert.equal(body.teeTimes[1].rateSource, null);
   assert.equal(body.teeTimes[2].priceBeforeTax, 35.5);
   assert.equal(body.meta.stale, false);
   assert.equal(res.headers.get('cache-control'), 'no-store');
@@ -96,6 +108,9 @@ test('successful empty results are cacheable while bad envelopes, verification, 
       assert.equal(data.successful, false);
       assert.doesNotMatch(JSON.stringify(data), /private|captcha|html/);
     }
+    assert.equal(h.calls.length, 1, 'a failure backs off for 30 seconds');
+    h.advance(30_000);
+    assert.equal((await h.fetch()).status, 502);
     assert.equal(h.calls.length, 2, 'failures are never cached');
   }
   for (const status of [403, 429, 500]) {
@@ -104,61 +119,74 @@ test('successful empty results are cacheable while bad envelopes, verification, 
   }
 });
 
-test('fresh entries are reused for 60 seconds and expired entries are refreshed', async () => {
+test('availability is fresh for two minutes, then served stale at once while one background refresh runs', async () => {
   const h = harness();
   const first = await (await h.fetch()).json();
-  h.advance(59_999);
+  h.advance(2 * 60_000 - 1);
   assert.deepEqual(await (await h.fetch()).json(), first);
   assert.equal(h.calls.length, 1);
   h.advance(1);
-  const second = await (await h.fetch()).json();
+  const stale = await Promise.all(Array.from({ length: 5 }, () => h.fetch().then(r => r.json())));
+  assert.ok(stale.every(body => body.meta.stale === true && body.meta.fetchedAt === first.meta.fetchedAt));
+  await h.service.idle();
+  assert.equal(h.calls.length, 2, 'exactly one refresh for concurrent stale readers');
+  const fresh = await (await h.fetch()).json();
+  assert.equal(fresh.meta.stale, false);
+  assert.notEqual(fresh.meta.fetchedAt, first.meta.fetchedAt);
   assert.equal(h.calls.length, 2);
-  assert.notEqual(first.meta.fetchedAt, second.meta.fetchedAt);
-  assert.equal(second.meta.stale, false);
 });
 
-test('stale availability is served only after upstream errors and never beyond five minutes from fetch', async () => {
+test('days two to seven stay fresh for ten minutes', async () => {
+  const h = harness(async () => response(times([])));
+  const far = request('courseId=16504&subCourseId=1032&date=2026-10-22');
+  await h.fetch(far);
+  h.advance(10 * 60_000 - 1);
+  assert.equal((await (await h.fetch(far)).json()).meta.stale, false);
+  assert.equal(h.calls.length, 1);
+  h.advance(1);
+  assert.equal((await (await h.fetch(far)).json()).meta.stale, true);
+});
+
+test('failed refreshes keep serving stale data until 30 minutes, then return a safe error', async () => {
   let fail = false;
   const h = harness(async () => { if (fail) throw new Error('private token'); return response(times()); });
   const first = await (await h.fetch()).json();
-  h.advance(60_000);
   fail = true;
-  const stale = await (await h.fetch()).json();
-  assert.equal(stale.meta.stale, true);
-  assert.equal(stale.meta.fetchedAt, first.meta.fetchedAt);
-  h.advance(240_000);
-  assert.equal((await (await h.fetch()).json()).meta.stale, true);
-  h.advance(1);
-  assert.equal((await h.fetch()).status, 502);
+  h.advance(5 * 60_000);
+  assert.equal((await (await h.fetch()).json()).meta.fetchedAt, first.meta.fetchedAt);
+  await h.service.idle();
+  assert.equal(h.calls.length, 2);
+  h.advance(10_000);
+  await h.fetch();
+  await h.service.idle();
+  assert.equal(h.calls.length, 2, 'no retry during the 30-second failure backoff');
+  h.advance(20_000);
+  await h.fetch();
+  await h.service.idle();
+  assert.equal(h.calls.length, 3, 'retry after the backoff');
+  h.advance(25 * 60_000);
+  const expired = await h.fetch();
+  assert.equal(expired.status, 502);
+  assert.doesNotMatch(await expired.text(), /private/);
   fail = false;
+  h.advance(30_000);
   assert.equal((await (await h.fetch()).json()).meta.stale, false);
 });
 
-test('stale max age is rechecked after a slow failing upstream request', async () => {
-  let fail = false;
-  const h = harness(async () => {
-    if (fail) { h.advance(10_000); throw new Error('down'); }
-    return response(times());
-  });
-  await h.fetch();
-  h.advance(299_000);
-  fail = true;
-  assert.equal((await h.fetch()).status, 502);
-});
-
-test('metadata caches for six hours and stale metadata is bounded to 24 hours', async () => {
+test('course metadata is fresh for 24 hours and served stale for up to seven days', async () => {
   let fail = false;
   const h = harness(async () => { if (fail) throw new Error('down'); return response({ companyCourses: [course()] }); });
-  const req = new Request('https://example.test/api/courses');
-  await h.fetch(req);
-  h.advance(6 * 3600_000 - 1);
-  await h.fetch(req);
+  const req = () => new Request('https://example.test/api/courses');
+  await h.fetch(req());
+  h.advance(24 * 3600_000 - 1);
+  await h.fetch(req());
   assert.equal(h.calls.length, 1);
   h.advance(1);
   fail = true;
-  assert.equal((await (await h.fetch(req)).json()).meta.stale, true);
-  h.advance(18 * 3600_000 + 1);
-  assert.equal((await h.fetch(req)).status, 502);
+  assert.equal((await (await h.fetch(req())).json()).meta.stale, true);
+  await h.service.idle();
+  h.advance(6 * 24 * 3600_000 + 1);
+  assert.equal((await h.fetch(req())).status, 502);
 });
 
 test('concurrent identical requests coalesce and distinct dates remain separate', async () => {
@@ -166,7 +194,7 @@ test('concurrent identical requests coalesce and distinct dates remain separate'
   const waiting = new Promise(resolve => { release = resolve; });
   const h = harness(async () => { await waiting; return response(times()); });
   const pending = Array.from({ length: 10 }, () => h.fetch());
-  await Promise.resolve();
+  await settle();
   assert.equal(h.calls.length, 1);
   release();
   assert.ok((await Promise.all(pending)).every(r => r.status === 200));
@@ -174,23 +202,25 @@ test('concurrent identical requests coalesce and distinct dates remain separate'
   assert.equal(h.calls.length, 2);
 });
 
-test('Cloudflare cache survives a new isolate and still enforces fresh and stale ages', async () => {
-  const stored = new Map();
-  const cache = { async match(req) { return stored.get(req.url)?.clone(); }, async put(req, res) { stored.set(req.url, res.clone()); } };
-  const h = harness(undefined, { cacheStorage: { default: cache } });
+test('Durable Object storage survives a new instance and still enforces fresh and stale ages', async () => {
+  const storage = memoryStorage();
+  const h = harness(undefined, { storage });
   await h.fetch();
-  assert.equal(stored.size, 1);
-  const h2 = harness(async () => { throw new Error('upstream unavailable'); }, { cacheStorage: { default: cache } });
+  assert.ok([...storage.map.keys()].includes('availability/16504/1032/2026-10-20'));
+  let clock = START;
+  const h2 = harness(async () => { throw new Error('upstream unavailable'); }, { storage, now: () => clock });
   assert.equal((await (await h2.fetch()).json()).meta.stale, false);
   assert.equal(h2.calls.length, 0);
-  h2.advance(60_000);
+  clock += 2 * 60_000;
   assert.equal((await (await h2.fetch()).json()).meta.stale, true);
-  h2.advance(300_000);
+  await h2.service.idle();
+  clock += 30 * 60_000;
   assert.equal((await h2.fetch()).status, 502);
 });
 
-test('cache outages use bounded memory and upstream timeout terminates even a fetch ignoring abort', async () => {
-  const h = harness(undefined, { cacheStorage: { async match() { throw new Error('cache down'); }, async put() { throw new Error('cache down'); } } });
+test('storage outages fall back to memory and upstream timeout terminates even a fetch ignoring abort', async () => {
+  const broken = { async get() { throw new Error('storage down'); }, async put() { throw new Error('storage down'); } };
+  const h = harness(undefined, { storage: broken });
   assert.equal((await h.fetch()).status, 200);
   await h.fetch();
   assert.equal(h.calls.length, 1);
@@ -213,6 +243,25 @@ test('routes have read-only methods, safe health and static asset passthrough', 
   const asset = await h.fetch(new Request('https://example.test/app.js'), { ASSETS: { fetch: async req => new Response(new URL(req.url).pathname) } });
   assert.equal(await asset.text(), '/app.js');
   assert.equal(h.calls.length, 0);
+  const noObject = createWorker({ now: () => START, cacheStorage: null });
+  assert.equal((await noObject.fetch(request(), {})).status, 503);
+});
+
+test('the edge caches successful day, course and weather responses for 30 seconds', async () => {
+  const stored = new Map();
+  const edge = { async match(req) { return stored.get(req.url)?.clone(); }, async put(req, res) { stored.set(req.url, res); } };
+  let objectRequests = 0;
+  const service = createUpstreamService({ now: () => START, fetchImpl: async url => String(url).includes('TeeFees') ? response({ teeFees: [] }) : response(times()) });
+  const worker = createWorker({ now: () => START, cacheStorage: { default: edge }, upstream: { fetch: req => { objectRequests++; return service.fetch(req); } } });
+  const day = () => worker.fetch(new Request('https://example.test/api/day?date=2026-10-20'), {});
+  const first = await day();
+  assert.equal(first.headers.get('cache-control'), 'no-store');
+  assert.equal((await day()).status, 200);
+  assert.equal(objectRequests, 1);
+  assert.match([...stored.values()][0].headers.get('cache-control'), /max-age=30/);
+  await worker.fetch(request(), {});
+  await worker.fetch(request(), {});
+  assert.equal(objectRequests, 3, 'single-unit availability is not edge-cached');
 });
 
 const dayRequest = (query = 'date=2026-10-20') => new Request(`https://example.test/api/day?${query}`);
@@ -240,7 +289,7 @@ test('day returns all eleven units with bounded concurrency and per-unit failure
   assert.deepEqual(failed.map(u => [u.courseId, u.code]), [[16507, 'UPSTREAM_RESPONSE'], [16511, 'UPSTREAM_UNAVAILABLE']]);
   assert.ok(failed.every(u => u.messageForUser && !u.teeTimes));
   const ok = body.units.find(u => u.courseId === 16504 && u.subCourseId === 1032);
-  assert.deepEqual(ok.teeTimes, [{ teeTimeID: 16504, dateScheduled: '2026-10-20T08:00:00.000-04:00', availableSlots: 2, maxSlots: 4, maxPlayers: 4, priceBeforeTax: 29 }]);
+  assert.deepEqual(ok.teeTimes, [{ teeTimeID: 16504, dateScheduled: '2026-10-20T08:00:00.000-04:00', availableSlots: 2, maxSlots: 4, maxPlayers: 4, priceBeforeTax: 29, rate: 29, rateSource: 'teetime' }]);
   assert.equal(ok.meta.stale, false);
   assert.ok(body.meta.fetchedAt);
   assert.doesNotMatch(JSON.stringify(body), /secret|private|captcha/);
@@ -251,12 +300,15 @@ test('day shares the per-unit availability cache with the single-unit route', as
   await h.fetch();
   const body = await (await h.fetch(dayRequest())).json();
   assert.equal(h.calls.length, 11, 'Inside 9 came from the cache');
+  assert.equal(h.feeCalls.length, 9, 'one rate card per course');
   assert.equal(body.units.every(u => u.ok), true);
-  await h.fetch(dayRequest());
+  for (let n = 0; n < 5; n++) await h.fetch(dayRequest());
   assert.equal(h.calls.length, 11);
-  h.advance(60_000);
+  h.advance(2 * 60_000);
   await h.fetch(dayRequest());
+  await h.service.idle();
   assert.equal(h.calls.length, 22);
+  assert.equal(h.feeCalls.length, 9);
 });
 
 test('day validates its date and parameters before fetching', async () => {

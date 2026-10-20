@@ -161,8 +161,17 @@ export function finishesAfterSunset(minute, holes, sunset) {
   return Number.isFinite(sunset) && finishMinutes(minute, holes) > sunset;
 }
 
+// Courses whose public rate includes a cart.
+export const CART_INCLUDED = new Set([16506, 16508]);
+
+/** The tee time's price: the Worker's `rate` (feed price or public rate card), else the raw feed price. */
+export function priceOf(time) {
+  const value = time.rate ?? time.priceBeforeTax;
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
 export function priceRange(times) {
-  const prices = times.map(t => t.priceBeforeTax).filter(p => typeof p === 'number' && Number.isFinite(p) && p > 0);
+  const prices = times.map(priceOf).filter(p => p !== null);
   if (!prices.length) return null;
   return { min: Math.min(...prices), max: Math.max(...prices) };
 }
@@ -241,7 +250,11 @@ export function formatAgo(ms) {
 /** The tooltip/aria sentence for one tee time. */
 export function describeTime({ time, unit, players, weather, sunset }) {
   const parts = [formatTime(time.minute), unit.name, `${booked(time)} booked`, `${time.availableSlots} open`];
-  if (time.priceBeforeTax) parts.push(formatPrice(time.priceBeforeTax));
+  const price = priceOf(time);
+  if (price !== null) {
+    const notes = [time.rateSource === 'ratecard' ? 'public rate' : '', CART_INCLUDED.has(unit.courseId) ? 'incl. cart' : ''].filter(Boolean);
+    parts.push([formatPrice(price), ...notes].join(' '));
+  }
   if (weather && Number.isFinite(weather.temp)) parts.push(`${weather.temp}°`);
   if (weather && weather.rain >= 10) parts.push(`${weather.rain}% rain`);
   const finish = finishMinutes(time.minute, unit.holes);

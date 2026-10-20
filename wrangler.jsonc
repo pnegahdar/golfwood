@@ -9,5 +9,9 @@
     "binding": "ASSETS",
     "run_worker_first": ["/api/*"]
   },
+  "durable_objects": {
+    "bindings": [{ "name": "UPSTREAM", "class_name": "UpstreamCache" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UpstreamCache"] }],
   "observability": { "enabled": true }
 }

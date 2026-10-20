@@ -1,7 +1,7 @@
 import * as lib from './lib.mjs';
 
 const { escapeHTML: esc } = lib;
-const REFRESH_AFTER = 60_000;
+const REFRESH_AFTER = 2 * 60_000; // matches the server's two-minute freshness for today and tomorrow
 const WEATHER_REFRESH_AFTER = 30 * 60_000;
 const TIMEOUT = 15_000;
 const MIN_PX_PER_MINUTE = 1.15;
@@ -355,7 +355,7 @@ function render() {
   const desktop = isWide();
   root.className = desktop ? 'layout-desktop' : 'layout-mobile';
   root.innerHTML = `${renderHeader()}${renderBand(ctx)}<main>${desktop ? renderTimeline(rows, ctx) : renderMobile(rows, ctx)}</main>
-    <footer class="foot">Independent finder. Tap a tee time to book on <a href="https://fox.tenfore.golf/mcggolf" target="_blank" rel="noopener">MCG Golf / TenFore</a>. TenFore preselects every open spot, so set your player count there. Prices and final availability are TenFore&rsquo;s.</footer>`;
+    <footer class="foot">Independent finder. Tap a tee time to book on <a href="https://fox.tenfore.golf/mcggolf" target="_blank" rel="noopener">MCG Golf / TenFore</a>. TenFore preselects every open spot, so set your player count there. Prices are public walking rates; member rates, carts and tax differ — confirm on TenFore. Final availability is TenFore&rsquo;s.</footer>`;
   for (const [sel, left] of scrollers) { const el = document.querySelector(sel); if (el) el.scrollLeft = left; }
   if (!scrollers[1][1]) document.querySelector('.day.is-on')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
   if (focusKey) root.querySelector(`[data-fkey="${CSS.escape(focusKey)}"]`)?.focus({ preventScroll: true });
